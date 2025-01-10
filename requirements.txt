@@ -1,0 +1,11 @@
+# Core dependencies
+torch>=2.0.0
+triton>=2.1.0
+
+# Testing
+pytest>=7.0.0
+pytest-benchmark>=4.0.0
+
+# Benchmarking and visualization
+matplotlib>=3.5.0
+pandas>=1.4.0
