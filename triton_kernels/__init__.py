@@ -6,7 +6,11 @@ This package provides fused and optimized kernels for common transformer operati
 
 __version__ = "0.1.0"
 
-# Kernel exports will be added as they are implemented:
-# from .rmsnorm_fused import rmsnorm_fused
-# from .swiglu_fused import swiglu_fused
-# from .quantized_matmul import int8_gemm, quantize_symmetric
+# RMSNorm kernels
+from triton_kernels.rmsnorm import rmsnorm, rmsnorm_torch, TritonRMSNorm
+
+__all__ = [
+    "rmsnorm",
+    "rmsnorm_torch",
+    "TritonRMSNorm",
+]
