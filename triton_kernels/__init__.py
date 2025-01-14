@@ -7,10 +7,19 @@ This package provides fused and optimized kernels for common transformer operati
 __version__ = "0.1.0"
 
 # RMSNorm kernels
-from triton_kernels.rmsnorm import rmsnorm, rmsnorm_torch, TritonRMSNorm
+from triton_kernels.rmsnorm import (
+    rmsnorm,
+    rmsnorm_torch,
+    rmsnorm_residual_fused,
+    rmsnorm_residual_torch,
+    TritonRMSNorm,
+)
 
 __all__ = [
+    # RMSNorm
     "rmsnorm",
     "rmsnorm_torch",
+    "rmsnorm_residual_fused",
+    "rmsnorm_residual_torch",
     "TritonRMSNorm",
 ]

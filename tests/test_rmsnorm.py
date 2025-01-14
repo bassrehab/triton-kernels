@@ -8,7 +8,13 @@ Tests various input shapes, dtypes, and edge cases.
 import pytest
 import torch
 
-from triton_kernels.rmsnorm import rmsnorm, rmsnorm_torch, TritonRMSNorm
+from triton_kernels.rmsnorm import (
+    rmsnorm,
+    rmsnorm_torch,
+    rmsnorm_residual_fused,
+    rmsnorm_residual_torch,
+    TritonRMSNorm,
+)
 
 
 # Skip all tests if CUDA is not available
@@ -230,6 +236,106 @@ class TestAgainstTorchRMSNorm:
         y_triton = triton_norm(x)
 
         torch.testing.assert_close(y_triton, y_torch, rtol=1e-2, atol=1e-3)
+
+
+class TestRMSNormResidualFused:
+    """Test suite for fused RMSNorm + residual kernel."""
+
+    @pytest.mark.parametrize("hidden_dim", [64, 128, 256, 512, 1024, 2048, 4096])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+    def test_correctness_1d(self, hidden_dim: int, dtype: torch.dtype):
+        """Test fused RMSNorm + residual on 1D input."""
+        x = torch.randn(hidden_dim, device="cuda", dtype=dtype)
+        residual = torch.randn(hidden_dim, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_dim, device="cuda", dtype=dtype)
+        eps = 1e-6
+
+        y_triton = rmsnorm_residual_fused(x, residual, weight, eps)
+        y_torch = rmsnorm_residual_torch(x, residual, weight, eps)
+
+        torch.testing.assert_close(y_triton, y_torch, rtol=1e-2, atol=1e-3)
+
+    @pytest.mark.parametrize("batch_size", [1, 2, 4])
+    @pytest.mark.parametrize("seq_len", [128, 512, 1024, 2048])
+    @pytest.mark.parametrize("hidden_dim", [1024, 2048, 4096])
+    def test_correctness_3d(self, batch_size: int, seq_len: int, hidden_dim: int):
+        """Test fused RMSNorm + residual on 3D input (batch, seq_len, hidden_dim)."""
+        x = torch.randn(batch_size, seq_len, hidden_dim, device="cuda", dtype=torch.float16)
+        residual = torch.randn_like(x)
+        weight = torch.randn(hidden_dim, device="cuda", dtype=torch.float16)
+        eps = 1e-6
+
+        y_triton = rmsnorm_residual_fused(x, residual, weight, eps)
+        y_torch = rmsnorm_residual_torch(x, residual, weight, eps)
+
+        torch.testing.assert_close(y_triton, y_torch, rtol=1e-2, atol=1e-3)
+
+    def test_output_shape_preserved(self):
+        """Verify output shape matches input shape for fused variant."""
+        shapes = [
+            (4096,),
+            (32, 4096),
+            (2, 1024, 4096),
+        ]
+        hidden_dim = 4096
+        weight = torch.randn(hidden_dim, device="cuda", dtype=torch.float16)
+
+        for shape in shapes:
+            x = torch.randn(shape, device="cuda", dtype=torch.float16)
+            residual = torch.randn(shape, device="cuda", dtype=torch.float16)
+            y = rmsnorm_residual_fused(x, residual, weight)
+            assert y.shape == x.shape, f"Shape mismatch: {y.shape} vs {x.shape}"
+
+    def test_equivalence_to_separate_ops(self):
+        """Verify fused kernel gives same result as separate add + rmsnorm."""
+        hidden_dim = 2048
+        batch_size = 4
+        seq_len = 512
+
+        x = torch.randn(batch_size, seq_len, hidden_dim, device="cuda", dtype=torch.float16)
+        residual = torch.randn_like(x)
+        weight = torch.randn(hidden_dim, device="cuda", dtype=torch.float16)
+        eps = 1e-6
+
+        # Fused
+        y_fused = rmsnorm_residual_fused(x, residual, weight, eps)
+
+        # Separate operations
+        y_separate = rmsnorm(x + residual, weight, eps)
+
+        torch.testing.assert_close(y_fused, y_separate, rtol=1e-2, atol=1e-3)
+
+    def test_numerical_stability(self):
+        """Test numerical stability with mixed scales."""
+        hidden_dim = 2048
+        batch_size = 4
+        seq_len = 256
+
+        # x is small, residual is large
+        x = torch.randn(batch_size, seq_len, hidden_dim, device="cuda", dtype=torch.float16) * 1e-3
+        residual = torch.randn_like(x) * 1e2
+        weight = torch.ones(hidden_dim, device="cuda", dtype=torch.float16)
+
+        y = rmsnorm_residual_fused(x, residual, weight, eps=1e-6)
+
+        assert not torch.isnan(y).any(), "NaN in output"
+        assert not torch.isinf(y).any(), "Inf in output"
+
+    def test_zero_residual(self):
+        """Test with zero residual (should equal plain rmsnorm)."""
+        hidden_dim = 1024
+        batch_size = 8
+        seq_len = 256
+
+        x = torch.randn(batch_size, seq_len, hidden_dim, device="cuda", dtype=torch.float16)
+        residual = torch.zeros_like(x)
+        weight = torch.randn(hidden_dim, device="cuda", dtype=torch.float16)
+        eps = 1e-6
+
+        y_fused = rmsnorm_residual_fused(x, residual, weight, eps)
+        y_plain = rmsnorm(x, weight, eps)
+
+        torch.testing.assert_close(y_fused, y_plain, rtol=1e-2, atol=1e-3)
 
 
 if __name__ == "__main__":
