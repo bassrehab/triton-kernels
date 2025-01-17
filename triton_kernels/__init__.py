@@ -15,6 +15,13 @@ from triton_kernels.rmsnorm import (
     TritonRMSNorm,
 )
 
+# SwiGLU kernels
+from triton_kernels.swiglu import (
+    swiglu_fused,
+    swiglu_torch,
+    SwiGLU,
+)
+
 __all__ = [
     # RMSNorm
     "rmsnorm",
@@ -22,4 +29,8 @@ __all__ = [
     "rmsnorm_residual_fused",
     "rmsnorm_residual_torch",
     "TritonRMSNorm",
+    # SwiGLU
+    "swiglu_fused",
+    "swiglu_torch",
+    "SwiGLU",
 ]
