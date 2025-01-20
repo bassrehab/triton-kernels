@@ -22,6 +22,15 @@ from triton_kernels.swiglu import (
     SwiGLU,
 )
 
+# Quantization utilities
+from triton_kernels.quantization import (
+    quantize_symmetric,
+    dequantize,
+    quantize_weight_per_channel,
+    calculate_quantization_error,
+    QuantizedLinear,
+)
+
 __all__ = [
     # RMSNorm
     "rmsnorm",
@@ -33,4 +42,10 @@ __all__ = [
     "swiglu_fused",
     "swiglu_torch",
     "SwiGLU",
+    # Quantization
+    "quantize_symmetric",
+    "dequantize",
+    "quantize_weight_per_channel",
+    "calculate_quantization_error",
+    "QuantizedLinear",
 ]
