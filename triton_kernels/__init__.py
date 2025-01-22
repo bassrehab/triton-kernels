@@ -31,6 +31,13 @@ from triton_kernels.quantization import (
     QuantizedLinear,
 )
 
+# INT8 GEMM
+from triton_kernels.quantized_matmul import (
+    int8_gemm,
+    int8_gemm_torch,
+    Int8Linear,
+)
+
 __all__ = [
     # RMSNorm
     "rmsnorm",
@@ -48,4 +55,8 @@ __all__ = [
     "quantize_weight_per_channel",
     "calculate_quantization_error",
     "QuantizedLinear",
+    # INT8 GEMM
+    "int8_gemm",
+    "int8_gemm_torch",
+    "Int8Linear",
 ]
