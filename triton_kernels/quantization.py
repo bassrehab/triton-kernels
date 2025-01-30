@@ -183,8 +183,16 @@ def calculate_quantization_error(
     max_abs_error = diff.abs().max().item()
     mean_abs_error = diff.abs().mean().item()
 
-    # Relative error (avoid division by zero)
-    rel_error = (diff.abs() / (original_float.abs() + 1e-10)).max().item() * 100
+    # Relative error: only consider significant values (> 10% of max) to avoid
+    # misleading high errors for small values. For 8-bit quantization, the max
+    # relative error is ~scale/(2*value), so small values inherently have high
+    # relative error even with perfect quantization.
+    threshold = original_float.abs().max() * 0.1
+    significant_mask = original_float.abs() > threshold
+    if significant_mask.any():
+        rel_error = (diff[significant_mask].abs() / original_float[significant_mask].abs()).max().item() * 100
+    else:
+        rel_error = 0.0
 
     # Signal-to-noise ratio
     signal_power = (original_float ** 2).mean()
