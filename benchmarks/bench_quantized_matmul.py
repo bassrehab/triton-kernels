@@ -110,8 +110,15 @@ def benchmark_int8_gemm(
     M: int,
     N: int,
     K: int,
+    use_cublas: bool = False,
 ) -> BenchmarkResult:
-    """Benchmark INT8 Triton GEMM."""
+    """Benchmark INT8 GEMM.
+
+    Args:
+        M, N, K: Matrix dimensions.
+        use_cublas: If True, use cuBLAS INT8 tensor cores (faster but less accurate).
+                    If False, use Triton FP16 dequantization (more accurate).
+    """
     x = torch.randn(M, K, device="cuda", dtype=torch.float16)
     weight_fp16 = torch.randn(N, K, device="cuda", dtype=torch.float16)
 
@@ -120,16 +127,24 @@ def benchmark_int8_gemm(
     weight_int8 = weight_int8.cuda()
     scale = scale.cuda()
 
+    # Pre-transpose for Triton path
+    weight_t = weight_int8.t().contiguous()
+
     flops, bytes_accessed = calculate_int8_gemm_metrics(M, N, K)
 
+    def int8_fn(x, w, s):
+        return int8_gemm(x, w, s, weight_transposed=weight_t, use_cublas=use_cublas)
+
+    name = f"INT8 GEMM ({'cuBLAS' if use_cublas else 'Triton'})"
+
     return benchmark_fn(
-        int8_gemm,
+        int8_fn,
         x,
         weight_int8,
         scale,
         flops=flops,
         bytes_accessed=bytes_accessed,
-        name=f"INT8 GEMM",
+        name=name,
     )
 
 

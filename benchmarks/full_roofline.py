@@ -134,17 +134,25 @@ def run_full_roofline(
     for M, N, K, desc in gemm_shapes:
         print(f"\n--- {desc}: ({M}, {N}, {K}) ---")
         fp16_result = benchmark_fp16_gemm(M, N, K)
-        int8_result = benchmark_int8_gemm(M, N, K)
+        int8_triton_result = benchmark_int8_gemm(M, N, K, use_cublas=False)
 
         # Rename for clarity
         fp16_result.name = f"FP16 GEMM ({desc})"
-        int8_result.name = f"INT8 GEMM ({desc})"
+        int8_triton_result.name = f"INT8 Triton ({desc})"
 
         print(fp16_result)
-        print(int8_result)
-        print(f"Speedup: {fp16_result.mean_ms/int8_result.mean_ms:.2f}x")
+        print(int8_triton_result)
+        print(f"Triton speedup: {fp16_result.mean_ms/int8_triton_result.mean_ms:.2f}x")
 
-        gemm_results.extend([fp16_result, int8_result])
+        gemm_results.extend([fp16_result, int8_triton_result])
+
+        # cuBLAS INT8 only works for M > 16
+        if M > 16:
+            int8_cublas_result = benchmark_int8_gemm(M, N, K, use_cublas=True)
+            int8_cublas_result.name = f"INT8 cuBLAS ({desc})"
+            print(int8_cublas_result)
+            print(f"cuBLAS speedup: {fp16_result.mean_ms/int8_cublas_result.mean_ms:.2f}x")
+            gemm_results.append(int8_cublas_result)
 
     all_results.extend(gemm_results)
 
