@@ -1,4 +1,4 @@
-# triton-kernels
+# Triton Kernels
 
 High-performance GPU kernels for LLM inference, implemented in [OpenAI Triton](https://triton-lang.org/).
 
