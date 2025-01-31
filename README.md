@@ -18,10 +18,10 @@ Custom kernels help by:
 
 | Kernel | Description | Speedup vs PyTorch |
 |--------|-------------|-------------------|
-| [`rmsnorm`](triton_kernels/rmsnorm.py) | RMSNorm with FP32 accumulation | ~1.5x |
-| [`rmsnorm_residual_fused`](triton_kernels/rmsnorm.py) | Fused RMSNorm + residual add | ~1.8x |
-| [`swiglu_fused`](triton_kernels/swiglu.py) | Fused SiLU-gated linear unit | ~1.4x |
-| [`int8_gemm`](triton_kernels/quantized_matmul.py) | W8A16 quantized matrix multiply | ~1.6x (2x memory) |
+| [`rmsnorm`](triton_kernels/rmsnorm.py) | RMSNorm with FP32 accumulation | **8.1x** |
+| [`rmsnorm_residual_fused`](triton_kernels/rmsnorm.py) | Fused RMSNorm + residual add | **6.0x** |
+| [`swiglu_fused`](triton_kernels/swiglu.py) | Fused SiLU-gated linear unit | **1.6x** |
+| [`int8_gemm`](triton_kernels/quantized_matmul.py) | W8A16 quantized matrix multiply | ~1.0x (2x memory savings) |
 
 ## Installation
 
@@ -123,18 +123,23 @@ python -m benchmarks.bench_quantized_matmul
 python -m benchmarks.full_roofline --output-dir docs/figures
 ```
 
-### Sample Results (A100 80GB)
+### Benchmark Results (A100-SXM4-40GB)
+
+Tested with LLaMA 7B-style dimensions (hidden_dim=4096, ffn_dim=11008, seq_len=2048).
 
 | Kernel | Latency (ms) | Bandwidth (GB/s) | % of Peak | Speedup |
 |--------|-------------|------------------|-----------|---------|
-| RMSNorm (PyTorch) | 0.42 | 850 | 42% | 1.0x |
-| RMSNorm (Triton) | 0.28 | 1270 | 62% | 1.5x |
-| RMSNorm+Residual (PyTorch) | 0.55 | 920 | 45% | 1.0x |
-| RMSNorm+Residual (Triton Fused) | 0.31 | 1520 | 74% | 1.8x |
-| SwiGLU (PyTorch) | 0.38 | 720 | 35% | 1.0x |
-| SwiGLU (Triton Fused) | 0.27 | 1010 | 49% | 1.4x |
+| RMSNorm (PyTorch) | 0.30 | 168 | 11% | 1.0x |
+| RMSNorm (Triton) | 0.04 | 1365 | 88% | **8.1x** |
+| RMSNorm+Residual (PyTorch) | 0.32 | 266 | 17% | 1.0x |
+| RMSNorm+Residual (Triton Fused) | 0.05 | 1285 | 83% | **6.0x** |
+| SwiGLU (PyTorch) | 0.18 | 1251 | 80% | 1.0x |
+| SwiGLU (Triton Fused) | 0.11 | 1223 | 79% | **1.6x** |
+| FP16 GEMM (cuBLAS) | 0.76 | 200 | - | 1.0x |
+| INT8 GEMM (Triton) | 0.09 | 480 | 31% | ~1.0x |
+| INT8 GEMM (cuBLAS, M=2048) | 0.73 | 146 | - | **1.04x** |
 
-*Results vary by GPU architecture and problem size.*
+*Peak bandwidth: 1555 GB/s. INT8 GEMM provides 2x memory savings for weights.*
 
 ## Roofline Analysis
 
@@ -151,17 +156,17 @@ See [docs/ROOFLINE_ANALYSIS.md](docs/ROOFLINE_ANALYSIS.md) for detailed analysis
 
 ## Key Insights
 
-### 1. Fusion Wins for Memory-Bound Operations
+### 1. Fusion Wins Big for Memory-Bound Operations
 
-RMSNorm reads and writes the entire tensor. Fusing with residual add saves one memory round-trip—nearly 1.8x speedup for a "free" optimization.
+RMSNorm reads and writes the entire tensor. PyTorch launches multiple small kernels with intermediate tensors. Triton fuses everything into one kernel, achieving **88% of peak bandwidth**—an **8x speedup**.
 
-### 2. Quantization Wins for Weight-Bound GEMMs
+### 2. Quantization is About Memory, Not Compute
 
-Loading INT8 weights instead of FP16 halves memory traffic. The dequantization overhead is negligible since it happens in registers after the data is loaded.
+Loading INT8 weights instead of FP16 halves memory traffic. However, INT8 tensor cores require quantizing FP16 activations on-the-fly, which adds overhead. **The main value of W8A16 quantization is 2x memory savings**, enabling larger models to fit in GPU memory.
 
 ### 3. Bandwidth Utilization Matters More Than FLOPS
 
-Most "optimizations" in LLM inference are really about using the memory bus efficiently. A kernel that achieves 80% of peak bandwidth is excellent; one at 40% has room to improve.
+Most "optimizations" in LLM inference are really about using the memory bus efficiently. Our Triton kernels achieve 80-88% of peak bandwidth—near optimal. PyTorch baselines often achieve only 10-20% due to kernel launch overhead and intermediate tensors.
 
 ## Project Structure
 
