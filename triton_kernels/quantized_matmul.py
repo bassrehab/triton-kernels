@@ -102,6 +102,168 @@ def _int8_gemm_cublas(
     return y_fp16
 
 
+def _int8_gemm_fused(
+    x: torch.Tensor,
+    weight_int8: torch.Tensor,
+    scale: torch.Tensor,
+    weight_transposed: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Fused W8A16 GEMM using Triton with INT8 tensor cores.
+
+    Fuses activation quantization, INT8 matmul, and dequantization into a single kernel.
+    This eliminates the overhead of separate kernel launches.
+
+    Args:
+        x: FP16 activations [M, K]
+        weight_int8: INT8 weights [N, K] (standard nn.Linear layout)
+        scale: FP32 per-channel scales [N]
+        weight_transposed: Optional pre-transposed weight [K, N]
+
+    Returns:
+        FP16 output [M, N]
+    """
+    M, K = x.shape
+    N = weight_int8.shape[0]
+
+    # Pre-compute per-row activation scales: absmax / 127
+    # This is a small overhead (~0.05ms) but allows fused kernel
+    act_scale = (x.abs().amax(dim=1) / 127.0).clamp(min=1e-6).float()
+
+    # Use pre-transposed weight if available
+    if weight_transposed is not None:
+        weight_t = weight_transposed
+    else:
+        weight_t = weight_int8.t().contiguous()
+
+    # Allocate output
+    y = torch.empty((M, N), device=x.device, dtype=torch.float16)
+
+    # Grid dimensions
+    def grid(META):
+        return (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+
+    # Launch fused kernel
+    _int8_gemm_fused_kernel[grid](
+        x,
+        weight_t,
+        y,
+        scale,
+        act_scale,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        weight_t.stride(0), weight_t.stride(1),
+        y.stride(0), y.stride(1),
+    )
+
+    return y
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def _int8_gemm_fused_kernel(
+    # Pointers
+    A,           # Activation pointer (FP16): [M, K]
+    B,           # Weight pointer (INT8): [K, N]
+    C,           # Output pointer (FP16): [M, N]
+    Scale,       # Weight scale pointer (FP32): [N] (per-output-channel)
+    ActScale,    # Activation scale pointer (FP32): [M] (per-row, computed externally)
+    # Matrix dimensions
+    M, N, K,
+    # Strides
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Fused W8A8 GEMM kernel using INT8 tensor cores.
+
+    This kernel fuses:
+    1. Loading FP16 activations
+    2. On-the-fly quantization to INT8 using pre-computed per-row scales
+    3. INT8 matmul using tensor cores (INT32 accumulation)
+    4. Dequantization to FP16 output
+
+    The activation scale (ActScale) must be pre-computed as:
+        ActScale[i] = max(|A[i, :]|) / 127.0
+
+    Output is computed as:
+        C[i,j] = (sum_k A_int8[i,k] * B[k,j]) * ActScale[i] * Scale[j]
+    """
+    # Program ID for this tile
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Compute offsets for this tile
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers for A and B tiles
+    a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    # Load scales for this tile
+    # Weight scale: per-channel (indexed by N)
+    w_scale = tl.load(Scale + offs_n, mask=offs_n < N, other=1.0)
+    # Activation scale: per-row (indexed by M)
+    a_scale = tl.load(ActScale + offs_m, mask=offs_m < M, other=1.0)
+
+    # Initialize accumulator in INT32 for INT8 tensor cores
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+
+    # Main loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        k_offs = k + offs_k
+
+        # Load A tile (FP16)
+        a_mask = (offs_m[:, None] < M) & (k_offs[None, :] < K)
+        a_fp16 = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+        # Quantize A to INT8 in registers
+        # A_int8 = round(A_fp16 / ActScale * 127)
+        # Since ActScale = absmax / 127, this becomes: A_int8 = round(A_fp16 * 127 / absmax)
+        # We need to scale by 127/ActScale = 127^2/absmax
+        inv_scale = 127.0 / (a_scale[:, None] * 127.0 + 1e-6)
+        a_int8 = (a_fp16 * inv_scale).to(tl.int8)
+
+        # Load B tile (INT8)
+        b_mask = (k_offs[:, None] < K) & (offs_n[None, :] < N)
+        b_int8 = tl.load(b_ptrs, mask=b_mask, other=0)
+
+        # INT8 matmul with INT32 accumulation
+        acc += tl.dot(a_int8, b_int8, out_dtype=tl.int32)
+
+        # Advance pointers
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Dequantize output: C = acc * ActScale * Scale
+    # The scales are: ActScale[i] (per-row), Scale[j] (per-column)
+    c_fp32 = acc.to(tl.float32) * a_scale[:, None] * w_scale[None, :]
+
+    # Write output tile (convert to FP16)
+    c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c_fp32.to(tl.float16), mask=c_mask)
+
+
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
