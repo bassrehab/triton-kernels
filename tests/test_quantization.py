@@ -141,7 +141,12 @@ class TestRoundTrip:
         restored = dequantize(quantized, scale, dtype=torch.float16)
 
         # Should still maintain reasonable relative accuracy
-        rel_error = (tensor - restored).abs() / (tensor.abs() + 1e-10)
+        # Use float32 for computation to avoid float16 precision issues (1e-10 is 0 in float16)
+        tensor_f32 = tensor.float()
+        restored_f32 = restored.float()
+        # Only consider non-zero values to avoid 0/0 = NaN
+        nonzero_mask = tensor_f32.abs() > 1e-6
+        rel_error = (tensor_f32[nonzero_mask] - restored_f32[nonzero_mask]).abs() / tensor_f32[nonzero_mask].abs()
         # Allow larger relative error for very small values
         assert rel_error.median() < 0.1
 
