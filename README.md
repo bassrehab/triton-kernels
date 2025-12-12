@@ -152,7 +152,7 @@ The roofline model shows where each kernel sits relative to hardware limits:
 
 Most LLM inference operations are memory-bound, which is why our optimizations focus on reducing memory traffic rather than raw FLOPS.
 
-See [docs/ROOFLINE_ANALYSIS.md](docs/ROOFLINE_ANALYSIS.md) for detailed analysis.
+See [docs/ROOFLINE_ANALYSIS.md](docs/ROOFLINE_ANALYSIS.md) for detailed analysis and [docs/INT8_GEMM_INVESTIGATION.md](docs/INT8_GEMM_INVESTIGATION.md) for the INT8 performance investigation.
 
 ## Key Insights
 

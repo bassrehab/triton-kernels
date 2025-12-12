@@ -145,6 +145,10 @@ memory access patterns, not just code tuning).
 5. **Profile your specific workload** - The optimal strategy depends on
    batch size, sequence length, and model architecture
 
+## Related Documentation
+
+- [INT8 GEMM Investigation](INT8_GEMM_INVESTIGATION.md) - Detailed write-up of the INT8 performance investigation
+
 ## References
 
 - [Making Deep Learning Go Brrrr](https://horace.io/brrr_intro.html) - Essential reading on GPU optimization
