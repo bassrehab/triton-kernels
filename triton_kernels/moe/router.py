@@ -76,8 +76,9 @@ def _softmax_topk_kernel(
         tl.store(TopK_Indices + pid * stride_idx_t + k, max_idx)
 
         # Mask out selected expert for next iteration
+        # Use -1.0 (below all softmax scores) to ensure argmax never re-selects
         mask = offsets == max_idx
-        scores = tl.where(mask, 0.0, scores)
+        scores = tl.where(mask, -1.0, scores)
 
 
 @triton.jit
@@ -124,7 +125,7 @@ def _sigmoid_topk_kernel(
 
         # Mask out selected expert
         mask = offsets == max_idx
-        scores = tl.where(mask, 0.0, scores)
+        scores = tl.where(mask, -1.0, scores)
 
     # Normalize weights to sum to 1
     inv_sum = 1.0 / (weight_sum + 1e-6)
