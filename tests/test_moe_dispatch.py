@@ -1,0 +1,378 @@
+"""
+Tests for MoE dispatch Triton kernels.
+
+Phase 1: Router kernel and reference implementation correctness.
+Later phases will add permute/unpermute, grouped GEMM, and fused pipeline tests.
+"""
+
+import pytest
+import torch
+
+from triton_kernels.moe.router import moe_router, moe_router_torch
+
+
+# Skip all tests if CUDA is not available
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA not available"
+)
+
+
+# ---------------------------------------------------------------------------
+# Model configurations from real MoE deployments
+# ---------------------------------------------------------------------------
+MODEL_CONFIGS = {
+    "mixtral-8x7b": {"num_experts": 8, "top_k": 2, "hidden_dim": 4096},
+    "mixtral-8x22b": {"num_experts": 8, "top_k": 2, "hidden_dim": 6144},
+    "deepseek-v3": {"num_experts": 256, "top_k": 8, "hidden_dim": 7168},
+    "qwen2-moe-57b": {"num_experts": 64, "top_k": 4, "hidden_dim": 3584},
+}
+
+
+class TestMoERouterSoftmax:
+    """Test MoE router with softmax gating against PyTorch reference."""
+
+    @pytest.mark.parametrize("num_tokens", [1, 32, 128, 512])
+    @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (64, 4), (256, 8)])
+    def test_topk_indices_valid(self, num_tokens: int, num_experts: int, top_k: int):
+        """Selected expert indices must be in [0, num_experts) and unique per token."""
+        hidden_dim = 256
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16)
+
+        indices, weights, logits = moe_router(hidden_states, router_weight, top_k, gating="softmax")
+
+        assert indices.shape == (num_tokens, top_k)
+        assert weights.shape == (num_tokens, top_k)
+        assert (indices >= 0).all() and (indices < num_experts).all(), "Indices out of range"
+
+        # Check uniqueness per token
+        for t in range(num_tokens):
+            assert len(indices[t].unique()) == top_k, f"Duplicate experts for token {t}"
+
+    @pytest.mark.parametrize("num_tokens", [1, 32, 128, 512])
+    @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (64, 4)])
+    def test_softmax_weights_match_reference(self, num_tokens: int, num_experts: int, top_k: int):
+        """Triton router softmax weights must match PyTorch reference."""
+        hidden_dim = 256
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16)
+
+        indices_triton, weights_triton, _ = moe_router(
+            hidden_states, router_weight, top_k, gating="softmax",
+        )
+        indices_torch, weights_torch, _ = moe_router_torch(
+            hidden_states, router_weight, top_k, gating="softmax",
+        )
+
+        # Same experts selected (order may differ, so sort per token)
+        for t in range(num_tokens):
+            triton_sorted = indices_triton[t].sort().values
+            torch_sorted = indices_torch[t].sort().values
+            assert torch.equal(triton_sorted, torch_sorted), (
+                f"Token {t}: Triton selected {indices_triton[t].tolist()} "
+                f"vs PyTorch {indices_torch[t].tolist()}"
+            )
+
+        # Weights close (compare sorted by expert index for order-independence)
+        torch.testing.assert_close(
+            weights_triton.float().sort(dim=-1).values,
+            weights_torch.float().sort(dim=-1).values,
+            rtol=1e-2, atol=1e-3,
+        )
+
+    @pytest.mark.parametrize("num_tokens", [1, 64, 256])
+    def test_softmax_weights_sum_to_topk_fraction(self, num_tokens: int):
+        """Softmax top-k weights should sum to a value <= 1.0 per token."""
+        num_experts = 8
+        top_k = 2
+        hidden_dim = 128
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16)
+
+        _, weights, _ = moe_router(hidden_states, router_weight, top_k, gating="softmax")
+
+        weight_sums = weights.float().sum(dim=-1)
+        assert (weight_sums <= 1.0 + 1e-3).all(), f"Weight sums exceed 1.0: {weight_sums}"
+        assert (weight_sums > 0.0).all(), "Weight sums should be positive"
+
+    def test_softmax_weights_positive(self):
+        """All softmax gating weights must be positive."""
+        num_tokens, num_experts, top_k, hidden_dim = 128, 8, 2, 256
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16)
+
+        _, weights, _ = moe_router(hidden_states, router_weight, top_k, gating="softmax")
+
+        assert (weights > 0).all(), "Softmax weights must be positive"
+
+
+class TestMoERouterSigmoid:
+    """Test MoE router with sigmoid gating."""
+
+    @pytest.mark.parametrize("num_tokens", [1, 32, 128])
+    @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (64, 4)])
+    def test_sigmoid_weights_match_reference(self, num_tokens: int, num_experts: int, top_k: int):
+        """Triton sigmoid router must match PyTorch reference."""
+        hidden_dim = 256
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16)
+
+        indices_triton, weights_triton, _ = moe_router(
+            hidden_states, router_weight, top_k, gating="sigmoid",
+        )
+        indices_torch, weights_torch, _ = moe_router_torch(
+            hidden_states, router_weight, top_k, gating="sigmoid",
+        )
+
+        # Same experts selected
+        for t in range(num_tokens):
+            triton_sorted = indices_triton[t].sort().values
+            torch_sorted = indices_torch[t].sort().values
+            assert torch.equal(triton_sorted, torch_sorted), (
+                f"Token {t}: Triton {indices_triton[t].tolist()} vs PyTorch {indices_torch[t].tolist()}"
+            )
+
+        # Weights close
+        torch.testing.assert_close(
+            weights_triton.float().sort(dim=-1).values,
+            weights_torch.float().sort(dim=-1).values,
+            rtol=1e-2, atol=1e-3,
+        )
+
+    @pytest.mark.parametrize("num_tokens", [1, 64])
+    def test_sigmoid_weights_normalized(self, num_tokens: int):
+        """Sigmoid top-k weights should be normalized to sum to ~1.0."""
+        num_experts, top_k, hidden_dim = 8, 2, 128
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16)
+
+        _, weights, _ = moe_router(hidden_states, router_weight, top_k, gating="sigmoid")
+
+        weight_sums = weights.float().sum(dim=-1)
+        torch.testing.assert_close(
+            weight_sums, torch.ones_like(weight_sums), rtol=1e-2, atol=1e-2,
+        )
+
+
+class TestMoERouterModelConfigs:
+    """Test router with realistic model configurations."""
+
+    @pytest.mark.parametrize("model_name", ["mixtral-8x7b", "mixtral-8x22b"])
+    @pytest.mark.parametrize("num_tokens", [1, 128, 1024])
+    def test_small_expert_count(self, model_name: str, num_tokens: int):
+        """Test with Mixtral-scale configs (8 experts)."""
+        cfg = MODEL_CONFIGS[model_name]
+        hidden_states = torch.randn(
+            num_tokens, cfg["hidden_dim"], device="cuda", dtype=torch.float16,
+        )
+        router_weight = torch.randn(
+            cfg["num_experts"], cfg["hidden_dim"], device="cuda", dtype=torch.float16,
+        )
+
+        indices, weights, logits = moe_router(
+            hidden_states, router_weight, cfg["top_k"], gating="softmax",
+        )
+
+        assert indices.shape == (num_tokens, cfg["top_k"])
+        assert weights.shape == (num_tokens, cfg["top_k"])
+        assert logits.shape == (num_tokens, cfg["num_experts"])
+        assert (indices >= 0).all() and (indices < cfg["num_experts"]).all()
+
+    @pytest.mark.parametrize("model_name", ["qwen2-moe-57b"])
+    @pytest.mark.parametrize("num_tokens", [1, 128])
+    def test_medium_expert_count(self, model_name: str, num_tokens: int):
+        """Test with Qwen2-scale configs (64 experts)."""
+        cfg = MODEL_CONFIGS[model_name]
+        hidden_states = torch.randn(
+            num_tokens, cfg["hidden_dim"], device="cuda", dtype=torch.float16,
+        )
+        router_weight = torch.randn(
+            cfg["num_experts"], cfg["hidden_dim"], device="cuda", dtype=torch.float16,
+        )
+
+        indices, weights, logits = moe_router(
+            hidden_states, router_weight, cfg["top_k"], gating="softmax",
+        )
+
+        assert indices.shape == (num_tokens, cfg["top_k"])
+        assert (indices >= 0).all() and (indices < cfg["num_experts"]).all()
+
+    @pytest.mark.parametrize("num_tokens", [1, 32])
+    def test_large_expert_count(self, num_tokens: int):
+        """Test with DeepSeek-V3 scale (256 experts, top-8)."""
+        cfg = MODEL_CONFIGS["deepseek-v3"]
+        hidden_states = torch.randn(
+            num_tokens, cfg["hidden_dim"], device="cuda", dtype=torch.float16,
+        )
+        router_weight = torch.randn(
+            cfg["num_experts"], cfg["hidden_dim"], device="cuda", dtype=torch.float16,
+        )
+
+        indices, weights, logits = moe_router(
+            hidden_states, router_weight, cfg["top_k"], gating="softmax",
+        )
+
+        assert indices.shape == (num_tokens, cfg["top_k"])
+        assert (indices >= 0).all() and (indices < cfg["num_experts"]).all()
+
+        # Check all 8 selected experts are unique per token
+        for t in range(num_tokens):
+            assert len(indices[t].unique()) == cfg["top_k"]
+
+
+class TestMoERouterEdgeCases:
+    """Edge cases and numerical stability tests."""
+
+    def test_single_token(self):
+        """Router works with a single token."""
+        hidden_states = torch.randn(1, 256, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(8, 256, device="cuda", dtype=torch.float16)
+
+        indices, weights, logits = moe_router(hidden_states, router_weight, top_k=2)
+
+        assert indices.shape == (1, 2)
+        assert not torch.isnan(weights).any()
+
+    def test_topk_equals_num_experts(self):
+        """When top_k == num_experts, all experts should be selected."""
+        num_tokens, num_experts, hidden_dim = 16, 4, 128
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16)
+
+        indices, weights, _ = moe_router(hidden_states, router_weight, top_k=num_experts)
+
+        for t in range(num_tokens):
+            assert set(indices[t].tolist()) == set(range(num_experts))
+
+        # Weights should sum to ~1.0 (full softmax)
+        torch.testing.assert_close(
+            weights.float().sum(dim=-1),
+            torch.ones(num_tokens, device="cuda"),
+            rtol=1e-2, atol=1e-2,
+        )
+
+    def test_no_nan_with_large_logits(self):
+        """Numerical stability: large logits should not produce NaN."""
+        num_tokens, num_experts, hidden_dim = 32, 8, 128
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16) * 100
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16)
+
+        indices, weights, logits = moe_router(hidden_states, router_weight, top_k=2)
+
+        assert not torch.isnan(weights).any(), "NaN in weights with large logits"
+        assert not torch.isinf(weights).any(), "Inf in weights with large logits"
+
+    def test_no_nan_with_small_logits(self):
+        """Numerical stability: very small logits should not produce NaN."""
+        num_tokens, num_experts, hidden_dim = 32, 8, 128
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16) * 1e-4
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16) * 1e-4
+
+        indices, weights, logits = moe_router(hidden_states, router_weight, top_k=2)
+
+        assert not torch.isnan(weights).any(), "NaN in weights with small logits"
+
+    def test_output_dtypes(self):
+        """Verify output tensor dtypes."""
+        hidden_states = torch.randn(16, 128, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(8, 128, device="cuda", dtype=torch.float16)
+
+        indices, weights, logits = moe_router(hidden_states, router_weight, top_k=2)
+
+        assert indices.dtype == torch.int64
+        assert weights.dtype == torch.float16
+        assert logits.dtype == torch.float16
+
+    def test_deterministic(self):
+        """Same inputs should produce same outputs."""
+        hidden_states = torch.randn(64, 256, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(8, 256, device="cuda", dtype=torch.float16)
+
+        idx1, w1, _ = moe_router(hidden_states, router_weight, top_k=2)
+        idx2, w2, _ = moe_router(hidden_states, router_weight, top_k=2)
+
+        assert torch.equal(idx1, idx2)
+        assert torch.equal(w1, w2)
+
+
+class TestMoEReferenceImplementation:
+    """Test the full reference MoE implementation."""
+
+    def test_reference_forward_shape(self):
+        """Reference MoE produces correct output shape."""
+        from reference.moe_reference import MoEReference
+
+        num_tokens, hidden_dim, ffn_dim = 32, 256, 512
+        num_experts, top_k = 8, 2
+
+        moe = MoEReference(hidden_dim, ffn_dim, num_experts, top_k).cuda().half()
+        x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+
+        output, routing = moe(x)
+
+        assert output.shape == (num_tokens, hidden_dim)
+        assert routing.top_k_indices.shape == (num_tokens, top_k)
+        assert routing.top_k_weights.shape == (num_tokens, top_k)
+
+    def test_reference_forward_no_nan(self):
+        """Reference MoE should not produce NaN."""
+        from reference.moe_reference import MoEReference
+
+        moe = MoEReference(256, 512, 8, 2).cuda().half()
+        x = torch.randn(64, 256, device="cuda", dtype=torch.float16)
+
+        output, _ = moe(x)
+
+        assert not torch.isnan(output).any(), "NaN in reference MoE output"
+        assert not torch.isinf(output).any(), "Inf in reference MoE output"
+
+    def test_reference_permute_unpermute_roundtrip(self):
+        """Permute -> unpermute should recover weighted original."""
+        from reference.moe_reference import permute_tokens, unpermute_tokens
+
+        num_tokens, hidden_dim, num_experts, top_k = 64, 128, 8, 2
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+
+        # Random routing
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+        top_k_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, device="cuda", dtype=torch.float32), dim=-1,
+        ).half()
+
+        # Permute
+        permuted, offsets, restore = permute_tokens(hidden_states, top_k_indices, num_experts)
+
+        # Use identity transform (no expert FFN)
+        # Unpermute with weights
+        output = unpermute_tokens(permuted, restore, top_k_weights)
+
+        # Output should equal weighted sum of duplicated inputs
+        expected = (
+            hidden_states.unsqueeze(1).expand(-1, top_k, -1)
+            * top_k_weights.unsqueeze(-1)
+        ).sum(dim=1)
+
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-3)
+
+    def test_reference_sigmoid_gating(self):
+        """Reference MoE works with sigmoid gating."""
+        from reference.moe_reference import MoEReference
+
+        moe = MoEReference(256, 512, 8, 2, gating="sigmoid").cuda().half()
+        x = torch.randn(32, 256, device="cuda", dtype=torch.float16)
+
+        output, routing = moe(x)
+
+        assert output.shape == (32, 256)
+        assert not torch.isnan(output).any()
+
+        # Sigmoid weights should be normalized
+        weight_sums = routing.top_k_weights.float().sum(dim=-1)
+        torch.testing.assert_close(
+            weight_sums, torch.ones_like(weight_sums), rtol=1e-2, atol=1e-2,
+        )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
