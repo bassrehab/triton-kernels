@@ -108,3 +108,6 @@ tmp/
 temp/
 *.log
 /triton-kernels-project/
+
+# Project planning / dev notes
+_dev/
