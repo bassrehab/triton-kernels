@@ -2,13 +2,20 @@
 Tests for MoE dispatch Triton kernels.
 
 Phase 1: Router kernel and reference implementation correctness.
-Later phases will add permute/unpermute, grouped GEMM, and fused pipeline tests.
+Phase 2: Permute/unpermute kernel correctness and roundtrip validation.
 """
 
 import pytest
 import torch
 
 from triton_kernels.moe.router import moe_router, moe_router_torch
+from triton_kernels.moe.permute import (
+    permute_tokens,
+    unpermute_tokens,
+    permute_tokens_torch,
+    unpermute_tokens_torch,
+    compute_permutation_indices,
+)
 
 
 # Skip all tests if CUDA is not available
@@ -383,6 +390,246 @@ class TestMoEReferenceImplementation:
         torch.testing.assert_close(
             weight_sums, torch.ones_like(weight_sums), rtol=1e-2, atol=1e-2,
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Permute/Unpermute Tests
+# ---------------------------------------------------------------------------
+
+
+class TestPermuteTokens:
+    """Test token permutation Triton kernel against PyTorch reference."""
+
+    @pytest.mark.parametrize("num_tokens", [1, 32, 128, 512])
+    @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (64, 4)])
+    @pytest.mark.parametrize("hidden_dim", [128, 1024, 4096])
+    def test_permute_matches_reference(
+        self, num_tokens: int, num_experts: int, top_k: int, hidden_dim: int,
+    ):
+        """Triton permute output must match PyTorch reference exactly."""
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+
+        permuted_triton, offsets_triton, _, _ = permute_tokens(
+            hidden_states, top_k_indices, num_experts,
+        )
+        permuted_torch, offsets_torch, _, _ = permute_tokens_torch(
+            hidden_states, top_k_indices, num_experts,
+        )
+
+        torch.testing.assert_close(permuted_triton, permuted_torch, rtol=0, atol=0)
+        assert torch.equal(offsets_triton, offsets_torch)
+
+    @pytest.mark.parametrize("num_tokens", [1, 64, 256])
+    def test_permute_output_shape(self, num_tokens: int):
+        """Permuted output has correct shape."""
+        num_experts, top_k, hidden_dim = 8, 2, 512
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+
+        permuted, offsets, sorted_idx, restore_idx = permute_tokens(
+            hidden_states, top_k_indices, num_experts,
+        )
+
+        assert permuted.shape == (num_tokens * top_k, hidden_dim)
+        assert offsets.shape == (num_experts + 1,)
+        assert sorted_idx.shape == (num_tokens * top_k,)
+        assert restore_idx.shape == (num_tokens * top_k,)
+
+    def test_expert_offsets_sum(self):
+        """Expert offsets should span all tokens * top_k."""
+        num_tokens, num_experts, top_k, hidden_dim = 64, 8, 2, 256
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+
+        _, offsets, _, _ = permute_tokens(hidden_states, top_k_indices, num_experts)
+
+        assert offsets[0].item() == 0
+        assert offsets[-1].item() == num_tokens * top_k
+        # Offsets should be non-decreasing
+        assert (offsets[1:] >= offsets[:-1]).all()
+
+    def test_expert_contiguity(self):
+        """Tokens for each expert should be contiguous in permuted output."""
+        num_tokens, num_experts, top_k, hidden_dim = 128, 8, 2, 64
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+
+        _, offsets, sorted_idx, _ = permute_tokens(hidden_states, top_k_indices, num_experts)
+
+        flat_experts = top_k_indices.reshape(-1)
+        sorted_experts = flat_experts[sorted_idx]
+
+        for e in range(num_experts):
+            start = offsets[e].item()
+            end = offsets[e + 1].item()
+            if start < end:
+                assert (sorted_experts[start:end] == e).all(), (
+                    f"Expert {e} tokens not contiguous"
+                )
+
+    def test_permute_preserves_values(self):
+        """Permutation should not alter token values, only their positions."""
+        num_tokens, hidden_dim, num_experts, top_k = 64, 256, 8, 2
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+
+        permuted, _, sorted_idx, _ = permute_tokens(hidden_states, top_k_indices, num_experts)
+
+        # Each permuted row should exactly match the source token
+        expanded = hidden_states.unsqueeze(1).expand(-1, top_k, -1).reshape(-1, hidden_dim)
+        expected = expanded[sorted_idx]
+
+        torch.testing.assert_close(permuted, expected, rtol=0, atol=0)
+
+
+class TestUnpermuteTokens:
+    """Test token unpermutation Triton kernel against PyTorch reference."""
+
+    @pytest.mark.parametrize("num_tokens", [1, 32, 128, 512])
+    @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (64, 4)])
+    @pytest.mark.parametrize("hidden_dim", [128, 1024, 4096])
+    def test_unpermute_matches_reference(
+        self, num_tokens: int, num_experts: int, top_k: int, hidden_dim: int,
+    ):
+        """Triton unpermute must match PyTorch reference."""
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+        top_k_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, device="cuda", dtype=torch.float32), dim=-1,
+        ).half()
+
+        # Permute (use torch reference to get shared sorted/restore indices)
+        permuted, _, sorted_idx, restore_idx = permute_tokens_torch(
+            hidden_states, top_k_indices, num_experts,
+        )
+
+        # Simulate expert outputs (identity = use permuted tokens as-is)
+        expert_outputs = permuted.clone()
+
+        out_triton = unpermute_tokens(expert_outputs, top_k_weights, restore_idx, num_tokens, top_k)
+        out_torch = unpermute_tokens_torch(expert_outputs, top_k_weights, restore_idx, num_tokens, top_k)
+
+        torch.testing.assert_close(out_triton, out_torch, rtol=1e-2, atol=1e-3)
+
+    def test_unpermute_output_shape(self):
+        """Unpermuted output has correct shape."""
+        num_tokens, num_experts, top_k, hidden_dim = 64, 8, 2, 512
+        expert_outputs = torch.randn(num_tokens * top_k, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_weights = torch.ones(num_tokens, top_k, device="cuda", dtype=torch.float16) / top_k
+        restore_idx = torch.arange(num_tokens * top_k, device="cuda")
+
+        output = unpermute_tokens(expert_outputs, top_k_weights, restore_idx, num_tokens, top_k)
+
+        assert output.shape == (num_tokens, hidden_dim)
+
+
+class TestPermuteUnpermuteRoundtrip:
+    """Test full permute -> unpermute roundtrip with Triton kernels."""
+
+    @pytest.mark.parametrize("num_tokens", [1, 32, 128, 512])
+    @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (64, 4), (256, 8)])
+    def test_roundtrip_identity(self, num_tokens: int, num_experts: int, top_k: int):
+        """Permute -> identity transform -> unpermute should equal weighted input."""
+        hidden_dim = 256
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+        top_k_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, device="cuda", dtype=torch.float32), dim=-1,
+        ).half()
+
+        # Permute
+        permuted, offsets, sorted_idx, restore_idx = permute_tokens(
+            hidden_states, top_k_indices, num_experts,
+        )
+
+        # Identity expert (no transformation)
+        # Unpermute
+        output = unpermute_tokens(permuted, top_k_weights, restore_idx, num_tokens, top_k)
+
+        # Expected: weighted sum of duplicated tokens
+        expected = (
+            hidden_states.unsqueeze(1).expand(-1, top_k, -1).float()
+            * top_k_weights.unsqueeze(-1).float()
+        ).sum(dim=1).half()
+
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-3)
+
+    @pytest.mark.parametrize("num_tokens", [32, 128])
+    def test_roundtrip_with_scaling(self, num_tokens: int):
+        """Permute -> scale by 2 -> unpermute should equal 2 * weighted input."""
+        num_experts, top_k, hidden_dim = 8, 2, 512
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+        top_k_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, device="cuda", dtype=torch.float32), dim=-1,
+        ).half()
+
+        permuted, _, sorted_idx, restore_idx = permute_tokens(
+            hidden_states, top_k_indices, num_experts,
+        )
+
+        # Scale expert outputs by 2
+        expert_outputs = permuted * 2.0
+
+        output = unpermute_tokens(expert_outputs, top_k_weights, restore_idx, num_tokens, top_k)
+
+        expected = 2.0 * (
+            hidden_states.unsqueeze(1).expand(-1, top_k, -1).float()
+            * top_k_weights.unsqueeze(-1).float()
+        ).sum(dim=1).half()
+
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-3)
+
+    def test_roundtrip_no_nan(self):
+        """Roundtrip should not produce NaN or Inf."""
+        num_tokens, num_experts, top_k, hidden_dim = 256, 64, 4, 1024
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+        top_k_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, device="cuda", dtype=torch.float32), dim=-1,
+        ).half()
+
+        permuted, _, _, restore_idx = permute_tokens(hidden_states, top_k_indices, num_experts)
+        output = unpermute_tokens(permuted, top_k_weights, restore_idx, num_tokens, top_k)
+
+        assert not torch.isnan(output).any()
+        assert not torch.isinf(output).any()
+
+
+class TestPermuteModelConfigs:
+    """Test permute/unpermute with realistic MoE model configurations."""
+
+    @pytest.mark.parametrize("model_name,num_tokens", [
+        ("mixtral-8x7b", 128),
+        ("mixtral-8x7b", 1024),
+        ("qwen2-moe-57b", 128),
+        ("deepseek-v3", 32),
+    ])
+    def test_model_config_roundtrip(self, model_name: str, num_tokens: int):
+        """Roundtrip works for real model dimensions."""
+        cfg = MODEL_CONFIGS[model_name]
+        hidden_dim = cfg["hidden_dim"]
+        num_experts = cfg["num_experts"]
+        top_k = cfg["top_k"]
+
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+        top_k_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, device="cuda", dtype=torch.float32), dim=-1,
+        ).half()
+
+        permuted, offsets, _, restore_idx = permute_tokens(
+            hidden_states, top_k_indices, num_experts,
+        )
+
+        assert permuted.shape == (num_tokens * top_k, hidden_dim)
+        assert offsets[-1].item() == num_tokens * top_k
+
+        output = unpermute_tokens(permuted, top_k_weights, restore_idx, num_tokens, top_k)
+
+        assert output.shape == (num_tokens, hidden_dim)
+        assert not torch.isnan(output).any()
 
 
 if __name__ == "__main__":

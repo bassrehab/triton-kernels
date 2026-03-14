@@ -10,8 +10,20 @@ The kernels use only Triton primitives for cross-platform portability
 """
 
 from triton_kernels.moe.router import moe_router, moe_router_torch
+from triton_kernels.moe.permute import (
+    permute_tokens,
+    unpermute_tokens,
+    permute_tokens_torch,
+    unpermute_tokens_torch,
+    compute_permutation_indices,
+)
 
 __all__ = [
     "moe_router",
     "moe_router_torch",
+    "permute_tokens",
+    "unpermute_tokens",
+    "permute_tokens_torch",
+    "unpermute_tokens_torch",
+    "compute_permutation_indices",
 ]
