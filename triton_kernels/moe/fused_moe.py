@@ -1,38 +1,46 @@
 """
 Fused MoE dispatch kernels — the core of this project.
 
-This module provides two key fused kernels and a top-level entry point that
-together eliminate most intermediate global memory traffic in the MoE forward pass.
+This module provides a fused gate+up GEMM kernel and a top-level entry point
+that eliminates most intermediate global memory traffic in the MoE forward pass.
 
-Fusion strategy (two-kernel approach):
-    Kernel 1: Fused gate+up GEMM with in-register SiLU activation
+Fusion strategy:
+    Fused gate+up GEMM with in-register SiLU activation:
         - Reads permuted tokens ONCE from global memory
         - Computes both gate and up projections in the same tile loop
         - Applies SiLU(gate) * up in registers before writing intermediate
         - Saves one full read+write of (total_tokens, ffn_dim) vs unfused
 
-    Kernel 2: Fused down GEMM with weighted scatter (unpermute + combine)
-        - Computes down projection and immediately scatters to output positions
-        - Applies gating weights during the scatter, not as a separate pass
-        - Saves one full read+write of (total_tokens, hidden_dim) vs unfused
+    Down projection + unpermute remain separate kernels:
+        - Down projection uses the grouped GEMM kernel from expert_gemm.py
+        - Unpermute uses the existing scatter kernel from permute.py
+
+    # subhadipmitra, 2026-03-15: I tried fusing the down projection with a
+    # weighted scatter (atomic_add to output positions), but Triton doesn't
+    # support scalar indexing into 2D accumulators (acc[m, :] fails to compile).
+    # A persistent-kernel approach could work but adds significant complexity.
+    # The gate+up fusion alone saves ~35% of global memory traffic, which is
+    # the majority of the win — the down+scatter fusion would add another ~15%.
+    # Leaving that as future work once Triton adds better indexing support.
 
 Memory traffic comparison for Mixtral-8x7B (4096 tokens, hidden=4096, ffn=14336):
-    Unfused pipeline:  ~1.2 GB  (permuted tokens + gate_out + up_out + intermediate + expert_out + final)
-    Fused pipeline:    ~0.6 GB  (permuted tokens + intermediate + scattered output)
-    Savings:           ~50% global memory traffic reduction
+    Unfused:  ~1.2 GB  (permuted + gate_out + up_out + intermediate + expert_out + final)
+    Fused:    ~0.8 GB  (permuted + intermediate + expert_out + final)
+    Savings:  ~35% global memory traffic reduction
 
 The router projection and permutation remain unfused — the router matmul is already
 optimal via cuBLAS, and the permutation requires a global sort that can't be fused
-with the GEMM without a persistent kernel approach (future work).
+with the GEMM without a persistent kernel approach.
 """
 
 import torch
 import triton
 import triton.language as tl
-from typing import Tuple, Optional
+from typing import Tuple
 
 from triton_kernels.moe.router import moe_router
 from triton_kernels.moe.permute import permute_tokens, unpermute_tokens
+from triton_kernels.moe.expert_gemm import grouped_gemm, _build_block_schedule
 
 
 # subhadipmitra, 2026-03-15: same BLOCK_M=64 constraint as the unfused grouped GEMM —
@@ -103,7 +111,10 @@ def _fused_gate_up_kernel(
     # Pointers for A (shared between gate and up)
     a_ptrs = A + (global_m_start + offs_m[:, None]) * stride_a_t + offs_k[None, :] * stride_a_k
 
-    # Pointers for gate and up weights (same expert, same N offset)
+    # subhadipmitra, 2026-03-15: the key insight for the pointer arithmetic here
+    # is that expert weights are flattened to (num_experts * N, K). So expert e's
+    # weight row j starts at offset (e * N + j). Gate and up weights use the same
+    # layout but are separate tensors
     bg_ptrs = B_gate + (expert_id * N + offs_n[None, :]) * stride_bg_n + offs_k[:, None] * stride_bg_k
     bu_ptrs = B_up + (expert_id * N + offs_n[None, :]) * stride_bu_n + offs_k[:, None] * stride_bu_k
 
@@ -123,11 +134,11 @@ def _fused_gate_up_kernel(
     for k_start in range(0, K, BLOCK_K):
         k_offs = k_start + offs_k
 
-        # Load A tile (shared)
+        # Load A tile (shared between both projections)
         a_mask = valid_m[:, None] & (k_offs[None, :] < K)
         a = tl.load(a_ptrs, mask=a_mask, other=0.0)
 
-        # Load gate weight tile
+        # Load gate and up weight tiles
         b_mask = (offs_n[None, :] < N) & (k_offs[:, None] < K)
         b_gate = tl.load(bg_ptrs, mask=b_mask, other=0.0)
         b_up = tl.load(bu_ptrs, mask=b_mask, other=0.0)
@@ -154,168 +165,6 @@ def _fused_gate_up_kernel(
     tl.store(c_ptrs, result.to(tl.float16), mask=c_mask)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=3, num_warps=4),
-    ],
-    key=['N', 'K'],
-)
-@triton.jit
-def _fused_down_scatter_kernel(
-    # Inputs
-    A,                  # intermediate: (total_tokens, K) where K = ffn_dim
-    B_down,             # down weights flattened: (num_experts * N, K) where N = hidden_dim
-    # Output (scattered to original token positions)
-    Output,             # (num_tokens, N) — final combined output
-    # Scatter metadata
-    ExpertOffsets,
-    BlockToExpert,
-    BlockToM,
-    RestoreIdx,         # (total_expanded_tokens,) — maps flat (token*topk+k) -> sorted position
-    TopK_Weights,       # (num_tokens, top_k) — gating weights
-    # Dimensions
-    N,                  # hidden_dim (output)
-    K,                  # ffn_dim (input)
-    num_blocks,
-    top_k,
-    # Strides
-    stride_a_t, stride_a_k,
-    stride_bd_n, stride_bd_k,
-    stride_o_t, stride_o_n,
-    stride_w_t,
-    # Tile sizes
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_M: tl.constexpr = 64,
-):
-    """
-    Fused down projection + weighted scatter to output positions.
-
-    Instead of:
-        1. down_out = intermediate @ W_down.T  (write to global)
-        2. unpermute: gather + weight + accumulate  (read from global)
-
-    We compute the down projection and atomically accumulate the weighted
-    result directly into the output tensor at the correct token position.
-    This eliminates the intermediate expert_output tensor.
-    """
-    pid = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    if pid >= num_blocks:
-        return
-
-    expert_id = tl.load(BlockToExpert + pid)
-    m_start = tl.load(BlockToM + pid)
-    expert_token_start = tl.load(ExpertOffsets + expert_id)
-    global_m_start = expert_token_start + m_start
-
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    a_ptrs = A + (global_m_start + offs_m[:, None]) * stride_a_t + offs_k[None, :] * stride_a_k
-    bd_ptrs = B_down + (expert_id * N + offs_n[None, :]) * stride_bd_n + offs_k[:, None] * stride_bd_k
-
-    expert_token_end = tl.load(ExpertOffsets + expert_id + 1)
-    expert_num_tokens = expert_token_end - expert_token_start
-    valid_m = m_start + offs_m < expert_num_tokens
-
-    # Down projection GEMM
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    for k_start in range(0, K, BLOCK_K):
-        k_offs = k_start + offs_k
-        a_mask = valid_m[:, None] & (k_offs[None, :] < K)
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b_mask = (offs_n[None, :] < N) & (k_offs[:, None] < K)
-        b = tl.load(bd_ptrs, mask=b_mask, other=0.0)
-        acc += tl.dot(a, b, out_dtype=tl.float32)
-        a_ptrs += BLOCK_K * stride_a_k
-        bd_ptrs += BLOCK_K * stride_bd_k
-
-    # subhadipmitra, 2026-03-15: now the tricky part — scatter each row of the
-    # down projection output to its original token position, weighted by the
-    # gating weight. We need to figure out which (token, k) pair each sorted
-    # row corresponds to, look up the gating weight, and atomically add to the
-    # output at the original token position.
-    #
-    # Using tl.atomic_add because multiple experts' outputs for the same token
-    # will write to the same output row. The alternative would be a two-pass
-    # approach (write to buffer, then reduce), but atomic_add is simpler and
-    # the contention is low (top_k writes per token, spread across many SMs)
-    # subhadipmitra, 2026-03-15: can't use `continue` in Triton loops, so we
-    # guard each iteration with a validity check instead. Triton compiles the
-    # loop body for all BLOCK_M iterations regardless — the mask just prevents
-    # stores for out-of-bounds rows
-    for m in range(BLOCK_M):
-        local_m = m_start + m
-        is_valid = local_m < expert_num_tokens
-
-        # This row's position in the sorted array
-        sorted_pos = global_m_start + m
-
-        # subhadipmitra, 2026-03-15: sorted_idx maps sorted_pos -> flat_idx,
-        # where flat_idx = token_id * top_k + k_idx. From that we recover
-        # which original token this row belongs to and which of its top_k
-        # expert slots it corresponds to, so we can look up the gating weight
-        flat_idx = tl.load(RestoreIdx + sorted_pos, mask=is_valid, other=0)
-        token_id = flat_idx // top_k
-        k_idx = flat_idx % top_k
-
-        # Look up gating weight
-        weight = tl.load(TopK_Weights + token_id * stride_w_t + k_idx, mask=is_valid, other=0.0).to(tl.float32)
-
-        # Weighted scatter to output
-        out_row = acc[m, :]
-        weighted = out_row * weight
-
-        n_mask = is_valid & (offs_n < N)
-        out_ptrs = Output + token_id * stride_o_t + offs_n
-        # subhadipmitra, 2026-03-15: atomic add because multiple experts contribute
-        # to the same token's output. On A100 this is ~2x slower than a regular
-        # store, but we're saving an entire unpermute kernel launch + memory roundtrip.
-        # Net win for batch sizes > ~64 tokens based on my profiling
-        tl.atomic_add(out_ptrs, weighted.to(tl.float32), mask=n_mask)
-
-
-def _build_block_schedule(
-    expert_offsets: torch.Tensor,
-    num_experts: int,
-    BLOCK_M: int = 64,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Build block-to-expert mapping (same logic as expert_gemm module)."""
-    offsets_cpu = expert_offsets.cpu()
-    expert_ids = []
-    m_offsets = []
-
-    for e in range(num_experts):
-        start = offsets_cpu[e].item()
-        end = offsets_cpu[e + 1].item()
-        num_tokens_e = end - start
-        if num_tokens_e == 0:
-            continue
-        num_blocks_e = (num_tokens_e + BLOCK_M - 1) // BLOCK_M
-        for b in range(num_blocks_e):
-            expert_ids.append(e)
-            m_offsets.append(b * BLOCK_M)
-
-    device = expert_offsets.device
-    if len(expert_ids) == 0:
-        return (
-            torch.zeros(1, dtype=torch.int64, device=device),
-            torch.zeros(1, dtype=torch.int64, device=device),
-            0,
-        )
-
-    block_to_expert = torch.tensor(expert_ids, dtype=torch.int64, device=device)
-    block_to_m = torch.tensor(m_offsets, dtype=torch.int64, device=device)
-    return block_to_expert, block_to_m, len(expert_ids)
-
-
 def fused_expert_ffn(
     permuted_tokens: torch.Tensor,
     w_gate: torch.Tensor,
@@ -329,10 +178,10 @@ def fused_expert_ffn(
     top_k: int,
 ) -> torch.Tensor:
     """
-    Fused expert FFN: gate+up+SiLU in one kernel, down+scatter in another.
+    Expert FFN with fused gate+up kernel, regular down projection + unpermute.
 
-    Eliminates intermediate gate_out, up_out, and expert_output tensors from
-    global memory. Only the intermediate (SiLU(gate)*up) result is materialized.
+    The gate+up fusion eliminates two intermediate buffers (gate_out, up_out)
+    from global memory by computing SiLU(gate) * up in registers.
 
     Parameters
     ----------
@@ -365,12 +214,11 @@ def fused_expert_ffn(
     total_tokens, hidden_dim = permuted_tokens.shape
     ffn_dim = w_gate.shape[1]
 
-    # Flatten weights
+    # Flatten weights for contiguous kernel access
     w_gate_flat = w_gate.reshape(num_experts * ffn_dim, hidden_dim).contiguous()
     w_up_flat = w_up.reshape(num_experts * ffn_dim, hidden_dim).contiguous()
-    w_down_flat = w_down.reshape(num_experts * hidden_dim, ffn_dim).contiguous()
 
-    # Build block schedule
+    # Build block schedule (shared between fused gate+up and down GEMM)
     block_to_expert, block_to_m, num_blocks = _build_block_schedule(
         expert_offsets, num_experts, BLOCK_M=64,
     )
@@ -378,13 +226,16 @@ def fused_expert_ffn(
     if num_blocks == 0:
         return torch.zeros(num_tokens, hidden_dim, device=permuted_tokens.device, dtype=permuted_tokens.dtype)
 
-    # --- Kernel 1: Fused gate + up + SiLU ---
+    # --- Fused gate + up + SiLU kernel ---
+    # subhadipmitra, 2026-03-15: this single kernel replaces what was previously
+    # two grouped_gemm() calls + a SiLU + multiply. The intermediate tensor is
+    # the only thing written to global memory here
     intermediate = torch.empty(total_tokens, ffn_dim, device=permuted_tokens.device, dtype=permuted_tokens.dtype)
 
-    def grid1(META):
+    def grid(META):
         return (num_blocks, triton.cdiv(ffn_dim, META['BLOCK_N']))
 
-    _fused_gate_up_kernel[grid1](
+    _fused_gate_up_kernel[grid](
         permuted_tokens,
         w_gate_flat, w_up_flat,
         intermediate,
@@ -396,30 +247,18 @@ def fused_expert_ffn(
         intermediate.stride(0), intermediate.stride(1),
     )
 
-    # --- Kernel 2: Fused down projection + weighted scatter ---
-    # subhadipmitra, 2026-03-15: output is zero-initialized because we use
-    # atomic_add to accumulate from multiple experts into the same output row.
-    # Float32 output for atomic precision, cast to FP16 at the end
-    output = torch.zeros(num_tokens, hidden_dim, device=permuted_tokens.device, dtype=torch.float32)
+    # --- Down projection via regular grouped GEMM ---
+    expert_output = grouped_gemm(intermediate, w_down, expert_offsets, num_experts)
 
-    def grid2(META):
-        return (num_blocks, triton.cdiv(hidden_dim, META['BLOCK_N']))
+    # --- Unpermute + weighted combine via regular kernel ---
+    # subhadipmitra, 2026-03-15: compute restore_idx from sorted_idx for unpermute.
+    # sorted_idx maps sorted_pos -> flat_idx, restore_idx is the inverse
+    restore_idx = torch.empty_like(sorted_idx)
+    restore_idx[sorted_idx] = torch.arange(len(sorted_idx), device=sorted_idx.device)
 
-    _fused_down_scatter_kernel[grid2](
-        intermediate,
-        w_down_flat,
-        output,
-        expert_offsets, block_to_expert, block_to_m,
-        sorted_idx,
-        top_k_weights,
-        hidden_dim, ffn_dim, num_blocks, top_k,
-        intermediate.stride(0), intermediate.stride(1),
-        w_down_flat.stride(0), w_down_flat.stride(1),
-        output.stride(0), output.stride(1),
-        top_k_weights.stride(0),
-    )
+    output = unpermute_tokens(expert_output, top_k_weights, restore_idx, num_tokens, top_k)
 
-    return output.to(permuted_tokens.dtype)
+    return output
 
 
 def fused_moe_forward(
@@ -436,10 +275,14 @@ def fused_moe_forward(
     Complete fused MoE forward pass.
 
     This is the top-level entry point that runs the full pipeline:
-        1. Router projection + gating + top-k selection
-        2. Token permutation to expert-contiguous layout
-        3. Fused gate+up GEMM with in-register SiLU
-        4. Fused down GEMM with weighted scatter to output
+        1. Router projection + gating + top-k selection (Triton kernel)
+        2. Token permutation to expert-contiguous layout (Triton kernel)
+        3. Fused gate+up GEMM with in-register SiLU (Triton kernel)
+        4. Down projection via grouped GEMM (Triton kernel)
+        5. Unpermute + weighted combine (Triton kernel)
+
+    Total: 5 kernel launches vs 7 in the unfused pipeline (router, permute,
+    gate GEMM, up GEMM, SiLU+mul, down GEMM, unpermute).
 
     Parameters
     ----------
@@ -481,7 +324,7 @@ def fused_moe_forward(
         hidden_states, top_k_indices, num_experts,
     )
 
-    # Step 3+4: Fused expert FFN + scatter
+    # Steps 3-5: Fused gate+up, then down, then unpermute
     output = fused_expert_ffn(
         permuted, w_gate, w_up, w_down,
         expert_offsets, num_experts,
