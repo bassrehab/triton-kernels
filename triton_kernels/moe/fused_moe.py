@@ -247,33 +247,33 @@ def _fused_down_scatter_kernel(
     # will write to the same output row. The alternative would be a two-pass
     # approach (write to buffer, then reduce), but atomic_add is simpler and
     # the contention is low (top_k writes per token, spread across many SMs)
+    # subhadipmitra, 2026-03-15: can't use `continue` in Triton loops, so we
+    # guard each iteration with a validity check instead. Triton compiles the
+    # loop body for all BLOCK_M iterations regardless — the mask just prevents
+    # stores for out-of-bounds rows
     for m in range(BLOCK_M):
         local_m = m_start + m
-        if local_m >= expert_num_tokens:
-            continue
+        is_valid = local_m < expert_num_tokens
 
         # This row's position in the sorted array
         sorted_pos = global_m_start + m
 
-        # subhadipmitra, 2026-03-15: walk the restore_idx to find which
-        # (token, k) pair this sorted position came from. sorted_idx maps
-        # sorted_pos -> flat_idx, but we have restore_idx which maps
-        # flat_idx -> sorted_pos. We need the inverse: given sorted_pos,
-        # find flat_idx. We stored sorted_idx during permutation, but
-        # in the fused entry point we pass it as RestoreIdx (repurposed).
-        # Actually, we'll pass sorted_idx here and compute token_id and k from it.
-        flat_idx = tl.load(RestoreIdx + sorted_pos)  # this is actually sorted_idx
+        # subhadipmitra, 2026-03-15: sorted_idx maps sorted_pos -> flat_idx,
+        # where flat_idx = token_id * top_k + k_idx. From that we recover
+        # which original token this row belongs to and which of its top_k
+        # expert slots it corresponds to, so we can look up the gating weight
+        flat_idx = tl.load(RestoreIdx + sorted_pos, mask=is_valid, other=0)
         token_id = flat_idx // top_k
         k_idx = flat_idx % top_k
 
         # Look up gating weight
-        weight = tl.load(TopK_Weights + token_id * stride_w_t + k_idx).to(tl.float32)
+        weight = tl.load(TopK_Weights + token_id * stride_w_t + k_idx, mask=is_valid, other=0.0).to(tl.float32)
 
         # Weighted scatter to output
         out_row = acc[m, :]
         weighted = out_row * weight
 
-        n_mask = offs_n < N
+        n_mask = is_valid & (offs_n < N)
         out_ptrs = Output + token_id * stride_o_t + offs_n
         # subhadipmitra, 2026-03-15: atomic add because multiple experts contribute
         # to the same token's output. On A100 this is ~2x slower than a regular
