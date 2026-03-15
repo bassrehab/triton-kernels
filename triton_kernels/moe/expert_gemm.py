@@ -34,19 +34,21 @@ import triton.language as tl
 from typing import Optional, Tuple
 
 
-# subhadipmitra, 2026-03-15: autotune configs chosen based on typical MoE shapes.
-# For Mixtral (8 experts, top-2), each expert gets ~25% of tokens on average,
-# so BLOCK_M=64 or 128 makes sense. For DeepSeek-V3 (256 experts, top-8),
-# per-expert batches are tiny (~1-4 tokens), so the 32x32 config matters.
+# subhadipmitra, 2026-03-15: autotune configs for BLOCK_N and BLOCK_K only.
+# BLOCK_M is fixed at 64 because it must match the block schedule built by
+# _build_block_schedule(). If we autotuned BLOCK_M, the schedule and kernel
+# would disagree on how many rows each block covers, causing overlapping writes
+# or missed rows. Learned this the hard way — spent an hour debugging why
+# larger batch sizes had 30-45% mismatched elements before realizing the
+# schedule was built with BLOCK_M=64 but autotune picked BLOCK_M=128.
 # Keying on (N, K) because those are fixed per model; M varies per expert
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_N': 32, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
     ],
     key=['N', 'K'],
 )
@@ -70,10 +72,10 @@ def _grouped_gemm_kernel(
     stride_a_t, stride_a_k,
     stride_b_n, stride_b_k,
     stride_c_t, stride_c_n,
-    # Tile sizes
-    BLOCK_M: tl.constexpr,
+    # Tile sizes — BLOCK_M is fixed to match block schedule, N/K are autotuned
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr = 64,
 ):
     """
     Grouped GEMM kernel: C[expert] = A[expert_tokens] @ B[expert].T
