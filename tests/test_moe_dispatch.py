@@ -22,6 +22,7 @@ from triton_kernels.moe.expert_gemm import (
     expert_ffn_triton,
     expert_ffn_torch,
 )
+from triton_kernels.moe.fused_moe import fused_moe_forward, fused_expert_ffn
 
 
 # Skip all tests if CUDA is not available
@@ -844,6 +845,194 @@ class TestEndToEndPhase3:
 
         assert output.shape == (num_tokens, hidden_dim)
         assert not torch.isnan(output).any()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Fused MoE Tests
+# ---------------------------------------------------------------------------
+
+
+class TestFusedGateUp:
+    """Test fused gate+up+SiLU kernel matches unfused pipeline."""
+
+    @pytest.mark.parametrize("num_tokens", [32, 128])
+    @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 4)])
+    def test_fused_ffn_matches_unfused(
+        self, num_tokens: int, num_experts: int, top_k: int,
+    ):
+        """Fused expert FFN output matches the unfused pipeline."""
+        hidden_dim, ffn_dim = 256, 512
+        torch.manual_seed(42)
+
+        data = _make_expert_data(num_tokens, num_experts, top_k, hidden_dim, ffn_dim)
+        permuted, offsets, sorted_idx, restore_idx, w_gate, w_up, w_down, top_k_indices, hidden_states = data
+
+        top_k_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, device="cuda", dtype=torch.float32), dim=-1,
+        ).half()
+
+        # Unfused pipeline
+        unfused_expert_out = expert_ffn_triton(permuted, w_gate, w_up, w_down, offsets, num_experts)
+        unfused_output = unpermute_tokens(unfused_expert_out, top_k_weights, restore_idx, num_tokens, top_k)
+
+        # Fused pipeline
+        fused_output = fused_expert_ffn(
+            permuted, w_gate, w_up, w_down,
+            offsets, num_experts,
+            top_k_weights, sorted_idx,
+            num_tokens, top_k,
+        )
+
+        # Relaxed tolerance due to different FP accumulation order between
+        # fused (SiLU in registers) vs unfused (SiLU on global memory values)
+        torch.testing.assert_close(fused_output, unfused_output, rtol=5e-2, atol=5e-2)
+
+    def test_fused_ffn_no_nan(self):
+        """Fused FFN should not produce NaN or Inf."""
+        num_tokens, num_experts, top_k = 128, 8, 2
+        hidden_dim, ffn_dim = 512, 1024
+        torch.manual_seed(42)
+
+        data = _make_expert_data(num_tokens, num_experts, top_k, hidden_dim, ffn_dim)
+        permuted, offsets, sorted_idx, restore_idx, w_gate, w_up, w_down, _, _ = data
+
+        top_k_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, device="cuda", dtype=torch.float32), dim=-1,
+        ).half()
+
+        output = fused_expert_ffn(
+            permuted, w_gate, w_up, w_down,
+            offsets, num_experts,
+            top_k_weights, sorted_idx,
+            num_tokens, top_k,
+        )
+
+        assert not torch.isnan(output).any(), "NaN in fused FFN output"
+        assert not torch.isinf(output).any(), "Inf in fused FFN output"
+
+    def test_fused_ffn_output_shape(self):
+        """Fused FFN output has correct shape."""
+        num_tokens, num_experts, top_k = 64, 8, 2
+        hidden_dim, ffn_dim = 256, 512
+
+        data = _make_expert_data(num_tokens, num_experts, top_k, hidden_dim, ffn_dim)
+        permuted, offsets, sorted_idx, restore_idx, w_gate, w_up, w_down, _, _ = data
+
+        top_k_weights = torch.softmax(
+            torch.randn(num_tokens, top_k, device="cuda", dtype=torch.float32), dim=-1,
+        ).half()
+
+        output = fused_expert_ffn(
+            permuted, w_gate, w_up, w_down,
+            offsets, num_experts,
+            top_k_weights, sorted_idx,
+            num_tokens, top_k,
+        )
+
+        assert output.shape == (num_tokens, hidden_dim)
+
+
+class TestFusedMoEForward:
+    """Test the complete fused MoE forward pass."""
+
+    @pytest.mark.parametrize("num_tokens", [32, 128])
+    @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 4)])
+    def test_fused_forward_matches_reference(
+        self, num_tokens: int, num_experts: int, top_k: int,
+    ):
+        """Fused MoE forward matches PyTorch reference MoE."""
+        from reference.moe_reference import MoEReference
+
+        hidden_dim, ffn_dim = 256, 512
+        torch.manual_seed(42)
+
+        ref_moe = MoEReference(hidden_dim, ffn_dim, num_experts, top_k).cuda().half()
+        x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+
+        # Reference
+        ref_output, ref_routing = ref_moe(x)
+
+        # Fused — use same routing to isolate GEMM correctness
+        permuted, offsets, sorted_idx, restore_idx = permute_tokens(
+            x, ref_routing.top_k_indices, num_experts,
+        )
+        fused_output = fused_expert_ffn(
+            permuted, ref_moe.w_gate, ref_moe.w_up, ref_moe.w_down,
+            offsets, num_experts,
+            ref_routing.top_k_weights, sorted_idx,
+            num_tokens, top_k,
+        )
+
+        # Relaxed tolerance — fused kernel has different accumulation order
+        torch.testing.assert_close(fused_output, ref_output, rtol=5e-2, atol=5e-2)
+
+    @pytest.mark.parametrize("model_name", ["mixtral-8x7b", "qwen2-moe-57b"])
+    def test_fused_forward_model_configs(self, model_name: str):
+        """Fused MoE runs without error at model-scale dimensions."""
+        cfg = MODEL_CONFIGS[model_name]
+        num_tokens = 64
+        hidden_dim = cfg["hidden_dim"]
+        num_experts = cfg["num_experts"]
+        top_k = cfg["top_k"]
+        ffn_dim = 512  # smaller to keep test fast
+
+        x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16)
+        w_gate = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16) * 0.02
+        w_up = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16) * 0.02
+        w_down = torch.randn(num_experts, hidden_dim, ffn_dim, device="cuda", dtype=torch.float16) * 0.02
+
+        output, indices, weights = fused_moe_forward(
+            x, router_weight, w_gate, w_up, w_down,
+            num_experts, top_k,
+        )
+
+        assert output.shape == (num_tokens, hidden_dim)
+        assert indices.shape == (num_tokens, top_k)
+        assert not torch.isnan(output).any()
+
+    def test_fused_forward_single_token(self):
+        """Fused MoE works with batch size 1."""
+        num_experts, top_k, hidden_dim, ffn_dim = 8, 2, 256, 512
+
+        x = torch.randn(1, hidden_dim, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16)
+        w_gate = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16) * 0.02
+        w_up = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16) * 0.02
+        w_down = torch.randn(num_experts, hidden_dim, ffn_dim, device="cuda", dtype=torch.float16) * 0.02
+
+        output, _, _ = fused_moe_forward(
+            x, router_weight, w_gate, w_up, w_down,
+            num_experts, top_k,
+        )
+
+        assert output.shape == (1, hidden_dim)
+        assert not torch.isnan(output).any()
+
+    def test_fused_sigmoid_gating(self):
+        """Fused MoE works with sigmoid gating."""
+        num_tokens, num_experts, top_k = 32, 8, 2
+        hidden_dim, ffn_dim = 256, 512
+
+        x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16)
+        w_gate = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16) * 0.02
+        w_up = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16) * 0.02
+        w_down = torch.randn(num_experts, hidden_dim, ffn_dim, device="cuda", dtype=torch.float16) * 0.02
+
+        output, _, weights = fused_moe_forward(
+            x, router_weight, w_gate, w_up, w_down,
+            num_experts, top_k, gating="sigmoid",
+        )
+
+        assert output.shape == (num_tokens, hidden_dim)
+        assert not torch.isnan(output).any()
+
+        # Sigmoid weights should be normalized
+        weight_sums = weights.float().sum(dim=-1)
+        torch.testing.assert_close(
+            weight_sums, torch.ones_like(weight_sums), rtol=1e-2, atol=1e-2,
+        )
 
 
 if __name__ == "__main__":

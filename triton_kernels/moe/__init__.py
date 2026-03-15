@@ -22,6 +22,10 @@ from triton_kernels.moe.expert_gemm import (
     expert_ffn_triton,
     expert_ffn_torch,
 )
+from triton_kernels.moe.fused_moe import (
+    fused_moe_forward,
+    fused_expert_ffn,
+)
 
 __all__ = [
     "moe_router",
@@ -34,4 +38,6 @@ __all__ = [
     "grouped_gemm",
     "expert_ffn_triton",
     "expert_ffn_torch",
+    "fused_moe_forward",
+    "fused_expert_ffn",
 ]
