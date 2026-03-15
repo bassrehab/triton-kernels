@@ -3,6 +3,7 @@ Tests for MoE dispatch Triton kernels.
 
 Phase 1: Router kernel and reference implementation correctness.
 Phase 2: Permute/unpermute kernel correctness and roundtrip validation.
+Phase 3: Grouped expert GEMM and SwiGLU FFN correctness.
 """
 
 import pytest
@@ -15,6 +16,11 @@ from triton_kernels.moe.permute import (
     permute_tokens_torch,
     unpermute_tokens_torch,
     compute_permutation_indices,
+)
+from triton_kernels.moe.expert_gemm import (
+    grouped_gemm,
+    expert_ffn_triton,
+    expert_ffn_torch,
 )
 
 
@@ -627,6 +633,214 @@ class TestPermuteModelConfigs:
         assert offsets[-1].item() == num_tokens * top_k
 
         output = unpermute_tokens(permuted, top_k_weights, restore_idx, num_tokens, top_k)
+
+        assert output.shape == (num_tokens, hidden_dim)
+        assert not torch.isnan(output).any()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Grouped Expert GEMM Tests
+# ---------------------------------------------------------------------------
+
+
+def _make_expert_data(num_tokens, num_experts, top_k, hidden_dim, ffn_dim):
+    """Helper: create permuted tokens and expert weights for GEMM tests."""
+    hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+    top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+
+    permuted, offsets, sorted_idx, restore_idx = permute_tokens(
+        hidden_states, top_k_indices, num_experts,
+    )
+
+    w_gate = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16) * 0.02
+    w_up = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16) * 0.02
+    w_down = torch.randn(num_experts, hidden_dim, ffn_dim, device="cuda", dtype=torch.float16) * 0.02
+
+    return permuted, offsets, sorted_idx, restore_idx, w_gate, w_up, w_down, top_k_indices, hidden_states
+
+
+class TestGroupedGemm:
+    """Test grouped GEMM kernel against loop-over-experts reference."""
+
+    @pytest.mark.parametrize("num_tokens", [32, 128, 512])
+    @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 4)])
+    def test_grouped_gemm_matches_reference(
+        self, num_tokens: int, num_experts: int, top_k: int,
+    ):
+        """Triton grouped GEMM output matches per-expert PyTorch matmul."""
+        hidden_dim, ffn_dim = 256, 512
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+
+        permuted, offsets, _, _ = permute_tokens(hidden_states, top_k_indices, num_experts)
+
+        weights = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16) * 0.02
+
+        # Triton grouped GEMM
+        out_triton = grouped_gemm(permuted, weights, offsets, num_experts)
+
+        # PyTorch reference: loop over experts
+        out_ref = torch.zeros(permuted.shape[0], ffn_dim, device="cuda", dtype=torch.float16)
+        for e in range(num_experts):
+            s, end = offsets[e].item(), offsets[e + 1].item()
+            if s == end:
+                continue
+            out_ref[s:end] = torch.nn.functional.linear(
+                permuted[s:end].float(), weights[e].float()
+            ).half()
+
+        torch.testing.assert_close(out_triton, out_ref, rtol=1e-2, atol=1e-2)
+
+    def test_grouped_gemm_output_shape(self):
+        """Grouped GEMM output has correct shape."""
+        num_tokens, num_experts, top_k = 64, 8, 2
+        hidden_dim, ffn_dim = 256, 512
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda")
+
+        permuted, offsets, _, _ = permute_tokens(hidden_states, top_k_indices, num_experts)
+        weights = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16)
+
+        out = grouped_gemm(permuted, weights, offsets, num_experts)
+
+        assert out.shape == (num_tokens * top_k, ffn_dim)
+
+    def test_grouped_gemm_empty_experts(self):
+        """Grouped GEMM handles experts with zero tokens."""
+        num_tokens, hidden_dim, ffn_dim = 32, 128, 256
+        num_experts = 16  # many experts, few tokens → some will be empty
+        top_k = 2
+
+        hidden_states = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        top_k_indices = torch.randint(0, 4, (num_tokens, top_k), device="cuda")  # only use 4 of 16
+
+        permuted, offsets, _, _ = permute_tokens(hidden_states, top_k_indices, num_experts)
+        weights = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16) * 0.02
+
+        out = grouped_gemm(permuted, weights, offsets, num_experts)
+
+        assert out.shape == (num_tokens * top_k, ffn_dim)
+        assert not torch.isnan(out).any()
+
+
+class TestExpertFFN:
+    """Test expert SwiGLU FFN (gate + up + down) against PyTorch reference."""
+
+    @pytest.mark.parametrize("num_tokens", [32, 128, 512])
+    @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 4)])
+    def test_expert_ffn_matches_reference(
+        self, num_tokens: int, num_experts: int, top_k: int,
+    ):
+        """Triton expert FFN matches PyTorch loop-over-experts reference."""
+        hidden_dim, ffn_dim = 256, 512
+        torch.manual_seed(42)
+
+        data = _make_expert_data(num_tokens, num_experts, top_k, hidden_dim, ffn_dim)
+        permuted, offsets, _, _, w_gate, w_up, w_down, _, _ = data
+
+        out_triton = expert_ffn_triton(permuted, w_gate, w_up, w_down, offsets, num_experts)
+        out_ref = expert_ffn_torch(permuted, w_gate, w_up, w_down, offsets, num_experts)
+
+        torch.testing.assert_close(out_triton, out_ref, rtol=1e-2, atol=1e-2)
+
+    def test_expert_ffn_output_shape(self):
+        """Expert FFN preserves token count and hidden dim."""
+        num_tokens, num_experts, top_k = 64, 8, 2
+        hidden_dim, ffn_dim = 256, 512
+
+        data = _make_expert_data(num_tokens, num_experts, top_k, hidden_dim, ffn_dim)
+        permuted, offsets, _, _, w_gate, w_up, w_down, _, _ = data
+
+        out = expert_ffn_triton(permuted, w_gate, w_up, w_down, offsets, num_experts)
+
+        assert out.shape == permuted.shape  # (num_tokens * top_k, hidden_dim)
+
+    def test_expert_ffn_no_nan(self):
+        """Expert FFN should not produce NaN."""
+        num_tokens, num_experts, top_k = 128, 8, 2
+        hidden_dim, ffn_dim = 512, 1024
+
+        data = _make_expert_data(num_tokens, num_experts, top_k, hidden_dim, ffn_dim)
+        permuted, offsets, _, _, w_gate, w_up, w_down, _, _ = data
+
+        out = expert_ffn_triton(permuted, w_gate, w_up, w_down, offsets, num_experts)
+
+        assert not torch.isnan(out).any(), "NaN in expert FFN output"
+        assert not torch.isinf(out).any(), "Inf in expert FFN output"
+
+
+class TestEndToEndPhase3:
+    """Test full pipeline: router → permute → expert FFN → unpermute."""
+
+    @pytest.mark.parametrize("num_tokens", [32, 128])
+    @pytest.mark.parametrize("num_experts,top_k", [(8, 2), (16, 4)])
+    def test_full_pipeline_matches_reference(
+        self, num_tokens: int, num_experts: int, top_k: int,
+    ):
+        """Full Triton pipeline matches reference MoE implementation."""
+        from reference.moe_reference import MoEReference
+
+        hidden_dim, ffn_dim = 256, 512
+        torch.manual_seed(42)
+
+        # Build reference model
+        ref_moe = MoEReference(hidden_dim, ffn_dim, num_experts, top_k).cuda().half()
+        x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+
+        # Reference forward
+        ref_output, ref_routing = ref_moe(x)
+
+        # Triton pipeline using same weights and routing
+        # Step 1: Use same routing results
+        top_k_indices = ref_routing.top_k_indices
+        top_k_weights = ref_routing.top_k_weights
+
+        # Step 2: Permute
+        permuted, offsets, sorted_idx, restore_idx = permute_tokens(
+            x, top_k_indices, num_experts,
+        )
+
+        # Step 3: Expert FFN via Triton grouped GEMM
+        triton_expert_out = expert_ffn_triton(
+            permuted, ref_moe.w_gate, ref_moe.w_up, ref_moe.w_down,
+            offsets, num_experts,
+        )
+
+        # Step 4: Unpermute
+        triton_output = unpermute_tokens(
+            triton_expert_out, top_k_weights, restore_idx, num_tokens, top_k,
+        )
+
+        torch.testing.assert_close(triton_output, ref_output, rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("model_name", ["mixtral-8x7b", "qwen2-moe-57b"])
+    def test_model_config_pipeline(self, model_name: str):
+        """Full pipeline runs without error at model-scale dimensions."""
+        cfg = MODEL_CONFIGS[model_name]
+        num_tokens = 64
+        hidden_dim = cfg["hidden_dim"]
+        num_experts = cfg["num_experts"]
+        top_k = cfg["top_k"]
+        ffn_dim = 512  # smaller than real to keep test fast
+
+        x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+        router_weight = torch.randn(num_experts, hidden_dim, device="cuda", dtype=torch.float16)
+
+        # Route
+        indices, weights, _ = moe_router(x, router_weight, top_k)
+
+        # Permute
+        permuted, offsets, _, restore_idx = permute_tokens(x, indices, num_experts)
+
+        # Expert FFN
+        w_gate = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16) * 0.02
+        w_up = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=torch.float16) * 0.02
+        w_down = torch.randn(num_experts, hidden_dim, ffn_dim, device="cuda", dtype=torch.float16) * 0.02
+
+        expert_out = expert_ffn_triton(permuted, w_gate, w_up, w_down, offsets, num_experts)
+
+        # Unpermute
+        output = unpermute_tokens(expert_out, weights, restore_idx, num_tokens, top_k)
 
         assert output.shape == (num_tokens, hidden_dim)
         assert not torch.isnan(output).any()

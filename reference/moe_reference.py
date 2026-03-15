@@ -70,13 +70,18 @@ def moe_router_torch(
     MoERoutingResult
         Named tuple with top_k_indices, top_k_weights, and router_logits.
     """
-    # Router logits: (num_tokens, num_experts)
+    # subhadipmitra, 2026-03-14: cast to float32 for the router projection to avoid
+    # precision issues — the logits are small differences between large dot products,
+    # so FP16 accumulation causes significant routing errors on Mixtral-scale dims
     router_logits = F.linear(hidden_states.float(), router_weight.float(), router_bias)
 
     # Apply gating function
     if gating == "softmax":
         scores = F.softmax(router_logits, dim=-1)
     elif gating == "sigmoid":
+        # subhadipmitra, 2026-03-14: DeepSeek-V3 uses sigmoid gating with per-token
+        # normalization instead of softmax. This gives more uniform expert utilization
+        # since sigmoid scores are independent (not competing via softmax denominator)
         scores = torch.sigmoid(router_logits)
     else:
         raise ValueError(f"Unknown gating function: {gating}. Use 'softmax' or 'sigmoid'.")
@@ -130,10 +135,15 @@ def permute_tokens(
     # Flatten expert assignments: (num_tokens * top_k,)
     flat_indices = top_k_indices.reshape(-1)
 
-    # Sort by expert index to group tokens per expert
+    # subhadipmitra, 2026-03-14: stable sort is critical here — it preserves the
+    # relative order of tokens assigned to the same expert, which makes the output
+    # deterministic and easier to debug. Unstable sort would give correct results
+    # but non-reproducible token ordering within each expert bucket
     sorted_expert_ids, sort_order = flat_indices.sort(stable=True)
 
     # Compute expert offsets (cumulative count boundaries)
+    # subhadipmitra, 2026-03-14: scatter_add histogram is faster than torch.bincount
+    # for GPU tensors — bincount does a CPU sync internally on some torch versions
     expert_counts = torch.zeros(num_experts, dtype=torch.int64, device=hidden_states.device)
     expert_counts.scatter_add_(0, flat_indices.long(), torch.ones_like(flat_indices, dtype=torch.int64))
     expert_offsets = torch.zeros(num_experts + 1, dtype=torch.int64, device=hidden_states.device)
@@ -217,6 +227,9 @@ def expert_ffn(
     torch.Tensor
         Expert output. Shape: (num_tokens_for_expert, hidden_dim).
     """
+    # subhadipmitra, 2026-03-14: SwiGLU is what LLaMA/Mixtral actually use, not
+    # vanilla ReLU FFN. The gate+up split with SiLU activation gives better
+    # training dynamics at the cost of 50% more parameters per expert
     gate = F.silu(F.linear(tokens.float(), w_gate.float()))
     up = F.linear(tokens.float(), w_up.float())
     return F.linear((gate * up).to(tokens.dtype), w_down)
@@ -314,6 +327,10 @@ class MoEReference(torch.nn.Module):
         )
 
         # Step 3: Run expert FFNs
+        # subhadipmitra, 2026-03-14: this loop-over-experts is the naive baseline
+        # that we're trying to beat with the Triton grouped GEMM. In practice this
+        # launches num_experts * 3 separate cuBLAS calls (gate, up, down per expert),
+        # each potentially under-utilizing the GPU due to small per-expert batch sizes
         expert_outputs = torch.empty_like(permuted_tokens)
         for e in range(self.num_experts):
             start = expert_offsets[e].item()

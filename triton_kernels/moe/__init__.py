@@ -17,6 +17,11 @@ from triton_kernels.moe.permute import (
     unpermute_tokens_torch,
     compute_permutation_indices,
 )
+from triton_kernels.moe.expert_gemm import (
+    grouped_gemm,
+    expert_ffn_triton,
+    expert_ffn_torch,
+)
 
 __all__ = [
     "moe_router",
@@ -26,4 +31,7 @@ __all__ = [
     "permute_tokens_torch",
     "unpermute_tokens_torch",
     "compute_permutation_indices",
+    "grouped_gemm",
+    "expert_ffn_triton",
+    "expert_ffn_torch",
 ]

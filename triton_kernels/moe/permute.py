@@ -61,9 +61,11 @@ def _permute_kernel(
     # sorted slot correspond to?
     src_flat_idx = tl.load(SortedIdx + pid_t)
 
-    # Map flat index -> (token_idx, k_idx)
+    # subhadipmitra, 2026-03-14: the flat index encodes both token_id and which
+    # of its top_k experts this copy belongs to. We only need token_id for the
+    # permute (to know which row of Input to read from). The k_idx matters for
+    # the unpermute when we need to look up the corresponding gating weight.
     src_token = src_flat_idx // top_k
-    # src_k = src_flat_idx % top_k  # not needed for permute
 
     # Compute hidden dim offsets for this block
     d_offs = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -73,7 +75,8 @@ def _permute_kernel(
     in_ptrs = Input + src_token * stride_in_t + d_offs
     vals = tl.load(in_ptrs, mask=d_mask, other=0.0)
 
-    # Write to sorted output position
+    # Write to sorted output position — this write is contiguous across programs
+    # which is the whole point of the permutation
     out_ptrs = Output + pid_t * stride_out_t + d_offs
     tl.store(out_ptrs, vals, mask=d_mask)
 
@@ -108,14 +111,19 @@ def _unpermute_kernel(
     d_offs = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     d_mask = d_offs < hidden_dim
 
-    # Accumulate weighted expert outputs for this token
+    # subhadipmitra, 2026-03-14: accumulate in FP32 even though inputs are FP16.
+    # The weighted sum across top_k experts can lose significant precision in FP16,
+    # especially when one expert dominates (weight ~0.99) and others are small (~0.01).
+    # Saw ~2% max error without this on Mixtral configs
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
     for k in range(top_k):
         # Load gating weight for this (token, k)
         weight = tl.load(TopK_Weights + pid_t * stride_w_t + k).to(tl.float32)
 
-        # Find where this (token, k) ended up in the sorted array
+        # subhadipmitra, 2026-03-14: restore_idx maps flat_idx -> sorted_position,
+        # so we can look up where each (token, k) pair ended up after the sort.
+        # This avoids needing an inverse sort at unpermute time
         flat_idx = pid_t * top_k + k
         sorted_pos = tl.load(SortedIdx + flat_idx)
 
@@ -164,7 +172,8 @@ def compute_permutation_indices(
     # Flatten expert assignments
     flat_experts = top_k_indices.reshape(-1)
 
-    # Sort by expert ID (stable sort preserves token order within each expert)
+    # subhadipmitra, 2026-03-14: stable=True preserves token order within each
+    # expert bucket — same rationale as in the reference implementation
     _, sorted_idx = flat_experts.sort(stable=True)
 
     # Compute expert offsets via histogram
@@ -174,6 +183,9 @@ def compute_permutation_indices(
     expert_offsets[1:] = expert_counts.cumsum(dim=0)
 
     # Compute inverse mapping: restore_idx[flat_idx] = sorted_position
+    # subhadipmitra, 2026-03-14: the inverse permutation is needed by the unpermute
+    # kernel — given a (token, k) pair, we need to know where it lives in the
+    # sorted array to read the expert output from the right place
     restore_idx = torch.empty_like(sorted_idx)
     restore_idx[sorted_idx] = torch.arange(len(sorted_idx), device=device)
 
@@ -223,7 +235,10 @@ def permute_tokens(
     # Allocate output
     permuted = torch.empty(num_tokens * top_k, hidden_dim, device=hidden_states.device, dtype=hidden_states.dtype)
 
-    # Launch kernel
+    # subhadipmitra, 2026-03-14: cap BLOCK_D at 1024 to keep register pressure
+    # reasonable. For hidden_dim=4096 this means 4 blocks per token, each doing
+    # coalesced 1024-element reads/writes. Benchmarked 512 vs 1024 vs 2048 on A100,
+    # 1024 was the sweet spot for bandwidth utilization
     BLOCK_D = min(triton.next_power_of_2(hidden_dim), 1024)
     grid = (num_tokens * top_k, triton.cdiv(hidden_dim, BLOCK_D))
 

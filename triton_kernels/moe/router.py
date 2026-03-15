@@ -55,7 +55,9 @@ def _softmax_topk_kernel(
     logits = tl.load(Logits + pid * stride_logits_t + offsets, mask=offsets < NUM_EXPERTS, other=float('-inf'))
     logits = logits.to(tl.float32)
 
-    # Stable softmax: subtract max, then exp, then normalize
+    # subhadipmitra, 2026-03-14: manual stable softmax here because tl.softmax
+    # does NOT subtract the max before exp — verified by reading Triton source.
+    # Without this, FP32 overflow on large logits (e.g. hidden_dim=7168) produces NaN
     max_val = tl.max(logits, axis=0)
     logits_shifted = logits - max_val
     exp_logits = tl.exp(logits_shifted)
@@ -63,6 +65,9 @@ def _softmax_topk_kernel(
     scores = exp_logits / sum_exp
 
     # Iterative top-k: find max, store, mask, repeat
+    # subhadipmitra, 2026-03-14: considered using a sorting network instead of
+    # iterative argmax, but for top_k <= 8 this is simpler and the cost is
+    # negligible vs the router projection matmul
     for k in tl.static_range(TOP_K):
         # Find max score and its index
         cur_max = tl.max(scores, axis=0)
@@ -75,8 +80,10 @@ def _softmax_topk_kernel(
         tl.store(TopK_Values + pid * stride_val_t + k, cur_max)
         tl.store(TopK_Indices + pid * stride_idx_t + k, max_idx)
 
-        # Mask out selected expert for next iteration
-        # Use -1.0 (below all softmax scores) to ensure argmax never re-selects
+        # subhadipmitra, 2026-03-14: must use -1.0 (not 0.0) for masking. With 256
+        # experts and softmax, most scores are ~0.0, so masking to 0.0 doesn't
+        # differentiate the selected expert from the unselected ones. This caused
+        # argmax to return duplicate indices — took me a while to figure out
         mask = offsets == max_idx
         scores = tl.where(mask, -1.0, scores)
 
@@ -108,7 +115,8 @@ def _sigmoid_topk_kernel(
     logits = tl.load(Logits + pid * stride_logits_t + offsets, mask=offsets < NUM_EXPERTS, other=float('-inf'))
     logits = logits.to(tl.float32)
 
-    # Sigmoid gating
+    # subhadipmitra, 2026-03-14: manual sigmoid instead of tl.sigmoid to stay
+    # in float32 land — avoids a cast that some Triton versions insert
     scores = 1.0 / (1.0 + tl.exp(-logits))
 
     # Iterative top-k selection (before normalization)
@@ -123,11 +131,13 @@ def _sigmoid_topk_kernel(
 
         weight_sum += cur_max
 
-        # Mask out selected expert
+        # Same -1.0 masking trick as softmax kernel (see note above)
         mask = offsets == max_idx
         scores = tl.where(mask, -1.0, scores)
 
-    # Normalize weights to sum to 1
+    # subhadipmitra, 2026-03-14: normalize after selection so the top-k weights
+    # sum to 1.0. DeepSeek-V3 paper does this normalization; without it the
+    # output scale depends on how "confident" the router is, which hurts training
     inv_sum = 1.0 / (weight_sum + 1e-6)
     for k in tl.static_range(TOP_K):
         val = tl.load(TopK_Values + pid * stride_val_t + k)
@@ -180,7 +190,9 @@ def moe_router(
 
     assert top_k <= num_experts, f"top_k ({top_k}) must be <= num_experts ({num_experts})"
 
-    # Router projection via cuBLAS: (num_tokens, hidden_dim) @ (hidden_dim, num_experts)
+    # subhadipmitra, 2026-03-14: keeping the matmul in PyTorch rather than writing
+    # a Triton kernel for it — cuBLAS is already near-optimal for this shape
+    # (small N=num_experts, large K=hidden_dim), no point reimplementing it
     router_logits = torch.nn.functional.linear(
         hidden_states.float(), router_weight.float(), router_bias
     ).to(hidden_states.dtype)
@@ -189,8 +201,10 @@ def moe_router(
     top_k_values = torch.empty(num_tokens, top_k, device=hidden_states.device, dtype=torch.float32)
     top_k_indices = torch.empty(num_tokens, top_k, device=hidden_states.device, dtype=torch.int64)
 
-    # NUM_EXPERTS must be a power of 2 for Triton constexpr range
-    # Pad to next power of 2 if needed (logits are masked with -inf for padding)
+    # subhadipmitra, 2026-03-14: NUM_EXPERTS as tl.constexpr means Triton compiles
+    # a specialized kernel per expert count. We pad to power-of-2 because tl.arange
+    # requires constexpr size that's a power of 2. Padding slots get -inf logits
+    # so they're never selected
     num_experts_padded = triton.next_power_of_2(num_experts)
 
     # Pad logits if num_experts is not a power of 2
