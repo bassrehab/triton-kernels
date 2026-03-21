@@ -187,16 +187,27 @@ def benchmark_fn(
         return fn(*args, **kwargs)
 
     # Run benchmark using Triton's do_bench
-    ms, min_ms, max_ms = triton.testing.do_bench(
-        bench_fn,
-        warmup=warmup,
-        rep=rep,
-        quantiles=quantiles,
-        return_mode="all",
-    )
+    # subhadipmitra, 2026-03-21: Triton 3.0 do_bench doesn't support return_mode="all".
+    # Use quantiles to get median, 20th, 80th percentile instead
+    try:
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            bench_fn, warmup=warmup, rep=rep,
+            quantiles=quantiles, return_mode="all",
+        )
+    except (AssertionError, TypeError):
+        # Triton 3.0 path: use quantiles parameter
+        result = triton.testing.do_bench(
+            bench_fn, warmup=warmup, rep=rep,
+            quantiles=quantiles,
+        )
+        if isinstance(result, (list, tuple)) and len(result) == 3:
+            ms, min_ms, max_ms = result
+        else:
+            ms = float(result)
+            min_ms = ms
+            max_ms = ms
 
     # Estimate std from quantiles (rough approximation)
-    # do_bench returns median, 20th percentile, 80th percentile
     std_ms = (max_ms - min_ms) / 2.0
 
     return BenchmarkResult(
