@@ -140,6 +140,34 @@ The fused gate+up kernel reads `permuted_tokens` once (instead of twice) and com
 - **Grouped GEMM**: Matches `torch.nn.functional.linear` per-expert within `rtol=1e-2, atol=1e-2`
 - **End-to-end**: Fused pipeline matches `MoEReference` within `rtol=5e-2, atol=5e-2` (relaxed due to FP accumulation order differences)
 
+## Comparison vs Megablocks (CUDA-Optimized Baseline)
+
+[Megablocks](https://github.com/stanford-futuredata/megablocks) (Stanford/Databricks) uses custom CUDA kernels with block-sparse matrix operations. It is the current state-of-the-art for MoE inference on NVIDIA GPUs.
+
+### Mixtral-8x7B — Triton Fused vs Megablocks dMoE
+
+| Tokens | Triton Fused | Megablocks | Triton / Megablocks |
+|--------|-------------|------------|---------------------|
+| 32     | **2.12 ms** | 2.78 ms    | **131%** (faster)   |
+| 128    | **2.23 ms** | 2.77 ms    | **124%** (faster)   |
+| 512    | 3.99 ms     | 3.57 ms    | **89%**             |
+| 2048   | 16.20 ms    | 9.08 ms    | 56%                 |
+
+### Qwen2-MoE-57B — Triton Fused vs Megablocks dMoE
+
+| Tokens | Triton Fused | Megablocks | Triton / Megablocks |
+|--------|-------------|------------|---------------------|
+| 32     | **2.82 ms** | 2.89 ms    | **103%** (faster)   |
+| 128    | 3.17 ms     | 3.31 ms    | **104%** (faster)   |
+| 512    | 3.58 ms     | 3.32 ms    | **93%**             |
+| 2048   | 6.59 ms     | 4.00 ms    | 61%                 |
+
+**Key findings:**
+- At **small batch sizes (≤128 tokens)**, our Triton fused kernel **beats Megablocks** — likely due to lower kernel launch overhead (5 launches vs Megablocks' more complex dispatch)
+- At **512 tokens**, we achieve **89-93% of Megablocks** throughput — exceeding our ≥70% target
+- At **2048+ tokens**, Megablocks' CUDA block-sparse matmul pulls ahead as the workload becomes fully compute-bound and Megablocks' hand-tuned CUDA kernels extract more tensor core utilization
+- **All this without a single line of CUDA** — our implementation is pure Triton, portable to AMD GPUs
+
 ## Limitations and Future Work
 
 1. **No down+scatter fusion**: Triton doesn't support scalar indexing into 2D accumulators (`acc[m, :]`), preventing fusion of the down projection with weighted scatter. A persistent kernel approach could work but adds complexity.
