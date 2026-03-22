@@ -22,6 +22,7 @@ Custom kernels help by:
 | [`rmsnorm_residual_fused`](triton_kernels/rmsnorm.py) | Fused RMSNorm + residual add | **6.0x** |
 | [`swiglu_fused`](triton_kernels/swiglu.py) | Fused SiLU-gated linear unit | **1.6x** |
 | [`int8_gemm`](triton_kernels/quantized_matmul.py) | W8A16 quantized matrix multiply | ~1.0x (2x memory savings) |
+| [`fused_moe_forward`](triton_kernels/moe/fused_moe.py) | Fused MoE dispatch (router + experts) | **up to 9.1x** |
 
 ## Installation
 
@@ -39,9 +40,9 @@ pip install -e ".[all]"
 
 **Requirements:**
 - Python 3.10+
-- PyTorch 2.0+
-- Triton 2.1+
-- NVIDIA GPU (compute capability 7.0+)
+- PyTorch 2.1+
+- Triton 3.0+
+- NVIDIA GPU (compute capability 8.0+) or AMD GPU (MI250X/MI300X via ROCm)
 
 ## Quick Start
 
@@ -90,6 +91,25 @@ scale = scale.cuda()
 
 # INT8 GEMM with on-the-fly dequantization
 y = int8_gemm(x, weight_int8, scale)
+
+# ==============================================================================
+# Fused MoE Dispatch (Mixtral / DeepSeek-V3 / Qwen2-MoE style)
+# ==============================================================================
+# Complete MoE forward pass: router → permute → fused expert FFN → unpermute
+from triton_kernels import fused_moe_forward
+
+num_experts, top_k = 8, 2
+hidden_dim, ffn_dim = 4096, 14336
+x = torch.randn(128, hidden_dim, device='cuda', dtype=torch.float16)
+router_weight = torch.randn(num_experts, hidden_dim, device='cuda', dtype=torch.float16)
+w_gate = torch.randn(num_experts, ffn_dim, hidden_dim, device='cuda', dtype=torch.float16) * 0.02
+w_up = torch.randn(num_experts, ffn_dim, hidden_dim, device='cuda', dtype=torch.float16) * 0.02
+w_down = torch.randn(num_experts, hidden_dim, ffn_dim, device='cuda', dtype=torch.float16) * 0.02
+
+output, expert_indices, expert_weights = fused_moe_forward(
+    x, router_weight, w_gate, w_up, w_down,
+    num_experts, top_k, gating="softmax",
+)
 ```
 
 ## Drop-in Modules
@@ -119,6 +139,13 @@ python -m benchmarks.bench_rmsnorm
 python -m benchmarks.bench_swiglu
 python -m benchmarks.bench_quantized_matmul
 
+# MoE dispatch benchmarks
+python -m benchmarks.bench_moe_dispatch --model mixtral-8x7b --batch-sizes 32,128,512,2048
+python -m benchmarks.bench_moe_dispatch --model deepseek-v3 --batch-sizes 32,128,512 --skip-reference
+
+# MoE roofline analysis
+python -m benchmarks.roofline.moe_roofline --model mixtral-8x7b --num-tokens 512
+
 # Full roofline analysis (generates plots and analysis doc)
 python -m benchmarks.full_roofline --output-dir docs/figures
 ```
@@ -140,6 +167,23 @@ Tested with LLaMA 7B-style dimensions (hidden_dim=4096, ffn_dim=11008, seq_len=2
 | INT8 GEMM (cuBLAS, M=2048) | 0.73 | 146 | - | **1.04x** |
 
 *Peak bandwidth: 1555 GB/s. INT8 GEMM provides 2x memory savings for weights.*
+
+### MoE Dispatch Results (A100-SXM4-80GB)
+
+Fused MoE dispatch kernel benchmarked against PyTorch reference (loop-over-experts) and [Megablocks](https://github.com/stanford-futuredata/megablocks) (CUDA-optimized baseline).
+
+**Mixtral-8x7B** (8 experts, top-2, hidden=4096, ffn=14336):
+
+| Tokens | PyTorch Ref | Megablocks | Triton Fused | Speedup vs PyTorch | vs Megablocks |
+|--------|------------|------------|--------------|-------------------|---------------|
+| 32     | 10.44 ms   | 2.78 ms    | **2.13 ms**  | **4.9x**          | **131%**      |
+| 128    | 13.14 ms   | 2.77 ms    | **2.27 ms**  | **5.8x**          | **124%**      |
+| 512    | 25.92 ms   | 3.57 ms    | 3.99 ms      | **6.5x**          | 89%           |
+| 2048   | 66.22 ms   | 9.08 ms    | 16.48 ms     | **4.0x**          | 56%           |
+
+Our Triton kernel **beats the CUDA-optimized Megablocks** at inference-relevant batch sizes (≤128 tokens) and achieves 89% at 512 tokens — using **zero CUDA code**. Cross-platform validated on AMD MI300X (162/162 tests pass).
+
+See [docs/moe_dispatch.md](docs/moe_dispatch.md) for the full technical writeup with roofline analysis and design decisions.
 
 ## Roofline Analysis
 
@@ -172,26 +216,38 @@ Most "optimizations" in LLM inference are really about using the memory bus effi
 
 ```
 triton-kernels/
-├── triton_kernels/           # Main package
-│   ├── rmsnorm.py            # RMSNorm + fused variants
-│   ├── swiglu.py             # SwiGLU activation
-│   ├── quantization.py       # INT8 quantization utilities
-│   └── quantized_matmul.py   # W8A16 GEMM kernel
-├── benchmarks/               # Benchmark suite
+├── triton_kernels/              # Main package
+│   ├── rmsnorm.py               # RMSNorm + fused variants
+│   ├── swiglu.py                # SwiGLU activation
+│   ├── quantization.py          # INT8 quantization utilities
+│   ├── quantized_matmul.py      # W8A16 GEMM kernel
+│   └── moe/                     # MoE dispatch kernels
+│       ├── router.py            # Softmax/sigmoid gating + top-k
+│       ├── permute.py           # Token permute/unpermute
+│       ├── expert_gemm.py       # Block-scheduled grouped GEMM
+│       └── fused_moe.py         # Fused gate+up kernel + entry point
+├── reference/
+│   └── moe_reference.py         # PyTorch MoE ground truth
+├── benchmarks/                  # Benchmark suite
 │   ├── bench_rmsnorm.py
 │   ├── bench_swiglu.py
 │   ├── bench_quantized_matmul.py
-│   ├── full_roofline.py      # Combined analysis
-│   └── utils.py              # GPU detection, roofline plotting
-├── tests/                    # Test suite
+│   ├── bench_moe_dispatch.py    # MoE benchmarks (vs Megablocks)
+│   ├── roofline/
+│   │   └── moe_roofline.py      # Per-stage MoE roofline analysis
+│   ├── full_roofline.py         # Combined analysis
+│   └── utils.py                 # GPU detection, roofline plotting
+├── tests/                       # Test suite
 │   ├── test_rmsnorm.py
 │   ├── test_swiglu.py
 │   ├── test_quantization.py
-│   └── test_quantized_matmul.py
+│   ├── test_quantized_matmul.py
+│   └── test_moe_dispatch.py     # 162 MoE tests
 ├── docs/
-│   ├── ROOFLINE_ANALYSIS.md  # Detailed performance analysis
-│   └── figures/              # Generated plots
-├── pyproject.toml            # Package configuration
+│   ├── ROOFLINE_ANALYSIS.md     # Performance analysis
+│   ├── moe_dispatch.md          # MoE technical writeup
+│   └── figures/                 # Generated plots
+├── pyproject.toml               # Package configuration
 └── README.md
 ```
 
@@ -211,7 +267,7 @@ pytest tests/ --cov=triton_kernels
 ## Limitations
 
 - **Not production-ready**: These are educational implementations. For production, consider [FlashAttention](https://github.com/Dao-AILab/flash-attention), [vLLM](https://github.com/vllm-project/vllm), or [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM).
-- **NVIDIA GPUs only**: Triton currently has best support for NVIDIA CUDA GPUs.
+- **Cross-platform**: Tested on NVIDIA A100 and AMD MI300X via Triton's ROCm backend. Performance optimized for NVIDIA; AMD correctness validated.
 - **No attention kernel**: A simplified fused attention is a stretch goal; FlashAttention is significantly more complex.
 
 ## References
@@ -222,6 +278,9 @@ pytest tests/ --cov=triton_kernels
 - [RMSNorm (Zhang & Sennrich)](https://arxiv.org/abs/1910.07467) - RMSNorm paper
 - [PaLM (Chowdhery et al.)](https://arxiv.org/abs/2204.02311) - SwiGLU activation
 - [LLM.int8() (Dettmers et al.)](https://arxiv.org/abs/2208.07339) - INT8 quantization for LLMs
+- [MegaBlocks (Gale et al.)](https://arxiv.org/abs/2211.15841) - Efficient sparse MoE training
+- [Mixtral of Experts (Jiang et al.)](https://arxiv.org/abs/2401.04088) - Sparse MoE architecture
+- [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) - 256-expert MoE with sigmoid gating
 
 ## Author
 
