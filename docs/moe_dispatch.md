@@ -178,7 +178,7 @@ The fused gate+up kernel reads `permuted_tokens` once (instead of twice) and com
 
 4. **No capacity factor / token dropping**: The current implementation processes all routed tokens. Adding a configurable capacity factor would prevent expert overflow in training scenarios.
 
-5. **AMD untested**: The kernels use only Triton primitives (no inline CUDA), so they should compile for AMD via `TRITON_BACKEND=hip`. Performance won't match NVIDIA but correctness should hold.
+5. **AMD validated (correctness only)**: All 162 tests pass on AMD MI300X (ROCm 6.1, PyTorch 2.4.1+rocm6.1) with zero code changes. Performance benchmarking on AMD is future work.
 
 ## Reproducing Results
 
