@@ -97,6 +97,9 @@ dmypy.json
 benchmark_results/
 roofline_*.png
 
+# Allow committed figures in docs
+!docs/figures/*.png
+
 # macOS
 .DS_Store
 .AppleDouble

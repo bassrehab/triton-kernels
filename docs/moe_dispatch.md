@@ -90,7 +90,15 @@ At 2048 tokens, the fused kernel is **1.8x faster than unfused** — the fusion 
 
 ## Roofline Analysis
 
-Per-stage roofline profiling at 512 tokens on A100-SXM4-80GB:
+Per-stage roofline profiling at 512 tokens on A100-SXM4-80GB.
+
+### Mixtral-8x7B Roofline
+
+![Mixtral-8x7B Roofline](figures/moe_roofline_mixtral.png)
+
+### DeepSeek-V3 Roofline
+
+![DeepSeek-V3 Roofline](figures/moe_roofline_deepseek.png)
 
 ### Mixtral-8x7B (512 tokens)
 

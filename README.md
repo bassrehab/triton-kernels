@@ -183,6 +183,8 @@ Fused MoE dispatch kernel benchmarked against PyTorch reference (loop-over-exper
 
 Our Triton kernel **beats the CUDA-optimized Megablocks** at inference-relevant batch sizes (≤128 tokens) and achieves 89% at 512 tokens — using **zero CUDA code**. Cross-platform validated on AMD MI300X (162/162 tests pass).
 
+![MoE Roofline — Mixtral-8x7B](docs/figures/moe_roofline_mixtral.png)
+
 See [docs/moe_dispatch.md](docs/moe_dispatch.md) for the full technical writeup with roofline analysis and design decisions.
 
 ## Roofline Analysis
