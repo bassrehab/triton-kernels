@@ -189,6 +189,47 @@ def bench_triton_fused(num_tokens: int, cfg: dict) -> BenchmarkResult:
     )
 
 
+def bench_megablocks(num_tokens: int, cfg: dict) -> BenchmarkResult:
+    """Benchmark Megablocks dMoE (Stanford/Databricks CUDA-optimized baseline)."""
+    from megablocks.layers.arguments import Arguments
+    from megablocks.layers.dmoe import dMoE
+    import torch.nn
+
+    hidden_dim = cfg["hidden_dim"]
+    ffn_dim = cfg["ffn_dim"]
+    num_experts = cfg["num_experts"]
+    top_k = cfg["top_k"]
+
+    # subhadipmitra, 2026-03-22: megablocks uses its own router, so we benchmark
+    # the full layer (router + expert dispatch) for fair comparison. We use
+    # mlp_type='glu' with SiLU to match our SwiGLU implementation
+    args = Arguments(
+        hidden_size=hidden_dim,
+        ffn_hidden_size=ffn_dim,
+        moe_num_experts=num_experts,
+        moe_top_k=top_k,
+        bias=False,
+        fp16=True,
+        moe_expert_model_parallelism=False,
+        device=torch.device("cuda"),
+        mlp_type="glu",
+        activation_fn=torch.nn.SiLU(),
+    )
+    moe = dMoE(args).cuda().half()
+
+    # Megablocks expects 3D: (seq_len, batch_size, hidden_dim)
+    x = torch.randn(num_tokens, 1, hidden_dim, device="cuda", dtype=torch.float16)
+
+    flops, bytes_acc = calculate_moe_metrics(num_tokens, hidden_dim, ffn_dim, num_experts, top_k)
+
+    return benchmark_fn(
+        lambda: moe(x),
+        name="Megablocks dMoE",
+        flops=flops,
+        bytes_accessed=bytes_acc,
+    )
+
+
 def run_benchmark(
     model_name: str,
     batch_sizes: list,
@@ -235,6 +276,15 @@ def run_benchmark(
             print(f"  {r}")
         except Exception as e:
             print(f"  Triton Fused: FAILED ({e})")
+
+        # subhadipmitra, 2026-03-22: megablocks is the CUDA-optimized baseline
+        # from Stanford/Databricks. Compare to validate our ≥70% target
+        try:
+            r = bench_megablocks(num_tokens, cfg)
+            results.append(r)
+            print(f"  {r}")
+        except Exception as e:
+            print(f"  Megablocks dMoE: FAILED ({e})")
 
         all_results.extend(results)
 
