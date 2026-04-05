@@ -38,6 +38,19 @@ from triton_kernels.quantized_matmul import (
     Int8Linear,
 )
 
+# MoE Dispatch
+from triton_kernels.moe import (
+    moe_router,
+    moe_router_torch,
+    permute_tokens,
+    unpermute_tokens,
+    grouped_gemm,
+    expert_ffn_triton,
+    expert_ffn_torch,
+    fused_moe_forward,
+    fused_expert_ffn,
+)
+
 __all__ = [
     # RMSNorm
     "rmsnorm",
@@ -59,4 +72,14 @@ __all__ = [
     "int8_gemm",
     "int8_gemm_torch",
     "Int8Linear",
+    # MoE Dispatch
+    "moe_router",
+    "moe_router_torch",
+    "permute_tokens",
+    "unpermute_tokens",
+    "grouped_gemm",
+    "expert_ffn_triton",
+    "expert_ffn_torch",
+    "fused_moe_forward",
+    "fused_expert_ffn",
 ]
