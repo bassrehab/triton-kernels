@@ -29,6 +29,7 @@ GPU_SPECS = {
     "V100-PCIE-32GB": {"bandwidth_gb_s": 900, "fp16_tflops": 125},
 
     # NVIDIA Consumer
+    "NVIDIA GeForce RTX 5090": {"bandwidth_gb_s": 1792, "fp16_tflops": 210},
     "NVIDIA GeForce RTX 4090": {"bandwidth_gb_s": 1008, "fp16_tflops": 165},
     "NVIDIA GeForce RTX 4080": {"bandwidth_gb_s": 717, "fp16_tflops": 97},
     "NVIDIA GeForce RTX 3090": {"bandwidth_gb_s": 936, "fp16_tflops": 71},
