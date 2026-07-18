@@ -51,6 +51,13 @@ from triton_kernels.moe import (
     fused_expert_ffn,
 )
 
+# W4A16 GEMM (4-bit weight-only)
+from triton_kernels.w4a16 import (
+    w4a16_gemm,
+    quantize_weight_int4_grouped,
+    pack_int4,
+)
+
 __all__ = [
     # RMSNorm
     "rmsnorm",
@@ -82,4 +89,8 @@ __all__ = [
     "expert_ffn_torch",
     "fused_moe_forward",
     "fused_expert_ffn",
+    # W4A16 GEMM
+    "w4a16_gemm",
+    "quantize_weight_int4_grouped",
+    "pack_int4",
 ]
