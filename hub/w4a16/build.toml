@@ -1,0 +1,20 @@
+# kernel-builder configuration for the W4A16 GEMM kernel (edition 5).
+#
+# Pure-Triton kernel: no C++/CUDA to compile. Declared as a torch-noarch (JIT) kernel
+# so one artifact runs on every Triton backend. Schema matches the moe-dispatch package
+# and the current huggingface/kernels relu-triton example.
+
+[general]
+name = "w4a16"
+version = 1
+edition = 5
+license = "MIT"
+backends = [
+    "cuda",
+    "rocm",
+]
+
+[general.hub]
+repo-id = "bassrehab/w4a16"
+
+[torch-noarch]
