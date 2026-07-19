@@ -20,9 +20,9 @@ NVIDIA (SM80/SM90) and AMD (MI300X) from a single universal build.
 y = x @ dequant(W_q)      # x FP16 (M,K), W_q INT4 packed (K//8, N), group-wise scale/zero
 ```
 
-It **beats cuBLAS FP16 in the decode regime** (~1.05-1.17x at batch size 1 on large FFN
-shapes, via a split-K dispatch) and matches FP16 for larger batches, with a 4x
-weight-memory reduction.
+It **beats cuBLAS FP16 across the decode regime** (~1.18-1.33x at batch size 1 on FFN and
+attention projections, via an autotuned split-K dispatch) and matches FP16 for larger
+batches, with a 4x weight-memory reduction.
 
 ## Usage
 

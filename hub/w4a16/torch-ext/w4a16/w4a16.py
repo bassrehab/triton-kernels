@@ -112,6 +112,20 @@ def _w4a16_gemm_kernel(
     tl.store(c_ptrs, acc.to(tl.float16), mask=c_mask)
 
 
+# subhadipmitra, 2026-07-19: autotune SPLIT_K / BLOCK_N / stages / warps. An A100 sweep
+# showed the best split-K config depends on the full shape (attn-qkv wants 8, llama-ffn
+# 4, qwen 8 - non-monotonic), so a fixed heuristic regresses some shapes. reset_to_zero
+# is required because the kernel accumulates into C with atomic_add: the autotuner must
+# re-zero C before each timing trial and the final run, or results are corrupted.
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': bn, 'BLOCK_K': 64, 'SPLIT_K': sk},
+                      num_stages=ns, num_warps=nw)
+        for bn in (64, 128) for sk in (4, 8, 16) for ns in (3, 4) for nw in (2, 4)
+    ],
+    key=['M', 'N', 'K'],
+    reset_to_zero=['C'],
+)
 @triton.jit
 def _w4a16_gemm_splitk_kernel(
     A, B, Scales, Zeros, C,
@@ -218,11 +232,13 @@ def w4a16_gemm(
     # larger M the non-split kernel wins (split-K's FP32 atomic output then costs more
     # than it saves).
     if M <= _W4A16_SPLITK_MAX_M:
-        BLOCK_M, BLOCK_N, BLOCK_K = 16, 128, 64
-        split_k = max(1, min(K // 512, 8))
+        # FP32 accumulator (split-K atomic-adds partials); autotune picks the config.
         c = torch.zeros((M, N), device=x.device, dtype=torch.float32)
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N), split_k)
-        _w4a16_gemm_splitk_kernel[grid](
+
+        def splitk_grid(meta):
+            return (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']), meta['SPLIT_K'])
+
+        _w4a16_gemm_splitk_kernel[splitk_grid](
             x, packed, scales, zeros, c,
             M, N, K,
             x.stride(0), x.stride(1),
@@ -231,8 +247,6 @@ def w4a16_gemm(
             zeros.stride(0), zeros.stride(1),
             c.stride(0), c.stride(1),
             GROUP_SIZE=group_size,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SPLIT_K=split_k,
-            num_stages=4, num_warps=4,
         )
         return c.to(torch.float16)
 
