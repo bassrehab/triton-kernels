@@ -26,20 +26,20 @@ import triton
 import triton.language as tl
 
 
-# subhadipmitra, 2026-07-18: all configs pin BLOCK_K to a multiple of 8 because the
-# int4 packing stores 8 nibbles per int32 along K; a tile must cover whole packed
-# int32 rows or the shift/unpack indexing breaks. Small-M configs are included on
-# purpose: W4A16 is a decode/small-batch kernel where the win is weight bandwidth.
+# subhadipmitra, 2026-07-19: configs use BLOCK_K in {32, 64} (multiples of 8, and
+# divisors of the supported group sizes 64/128) so each K-tile lies within a single
+# quantization group and covers whole packed int32 rows. Small-M configs are first:
+# W4A16 is a decode/small-batch kernel where the win is weight bandwidth.
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
         triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
     ],
     key=['M', 'N', 'K'],
 )
@@ -68,36 +68,34 @@ def _w4a16_gemm_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
+    offs_kp = tl.arange(0, BLOCK_K // 8)   # packed rows within a tile (one int32 = 8 K rows)
+    shifts = (tl.arange(0, 8) * 4)         # [8] nibble shifts, one per K within an int32
 
     a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    # Packed weight: local row offs_k maps to packed row offs_k // 8; the nibble for
-    # this k is selected by shifting right by (offs_k % 8) * 4 bits.
-    b_ptrs = B + (offs_k[:, None] // 8) * stride_bk + offs_n[None, :] * stride_bn
-    shifter = (offs_k % 8) * 4  # [BLOCK_K]
+    b_ptrs = B + offs_kp[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k in range(0, K, BLOCK_K):
-        kk = k + offs_k  # global K indices for this tile
+        kk = k + offs_k
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (kk[None, :] < K), other=0.0)
 
-        a_mask = (offs_m[:, None] < M) & (kk[None, :] < K)
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        # subhadipmitra, 2026-07-19: load each packed int32 ONCE (BLOCK_K // 8 rows) and
+        # unpack all 8 nibbles in registers via a broadcast shift, then reshape to the
+        # (BLOCK_K, BLOCK_N) weight tile. The old kernel indexed with offs_k // 8, which
+        # reloaded each int32 8 times and moved ~8x the weight traffic; this is the fix.
+        pk_row = k // 8 + offs_kp
+        pk = tl.load(b_ptrs, mask=(pk_row[:, None] < (K // 8)) & (offs_n[None, :] < N), other=0)
+        b = (pk[:, None, :] >> shifts[None, :, None]) & 0xF   # (BLOCK_K // 8, 8, BLOCK_N)
+        b = tl.reshape(b, (BLOCK_K, BLOCK_N)).to(tl.float16)  # row 8*i + j -> K = 8*i + j
 
-        bn_mask = (kk[:, None] < K) & (offs_n[None, :] < N)
-        b_packed = tl.load(b_ptrs, mask=bn_mask, other=0)
-        # subhadipmitra, 2026-07-18: unpack the 4-bit nibble in registers. Masked-out
-        # rows load 0 and dequantize to a nonzero (0 - zero) * scale, but the matching
-        # `a` is masked to 0, so those terms contribute nothing to the accumulator.
-        b_int = (b_packed >> shifter[:, None]) & 0xF
+        # One scale/zero row per tile: BLOCK_K divides GROUP_SIZE, so the whole tile is
+        # in a single group. This replaces the per-element (BLOCK_K, BLOCK_N) scale load.
+        gid = k // GROUP_SIZE
+        s = tl.load(Scales + gid * stride_sk + offs_n * stride_sn, mask=offs_n < N, other=1.0)
+        z = tl.load(Zeros + gid * stride_zk + offs_n * stride_zn, mask=offs_n < N, other=0.0)
+        b = (b - z[None, :].to(tl.float16)) * s[None, :].to(tl.float16)
 
-        # Per-group scale / zero, indexed by the group of each K row.
-        g = kk // GROUP_SIZE
-        s = tl.load(Scales + g[:, None] * stride_sk + offs_n[None, :] * stride_sn,
-                    mask=bn_mask, other=1.0)
-        z = tl.load(Zeros + g[:, None] * stride_zk + offs_n[None, :] * stride_zn,
-                    mask=bn_mask, other=0.0)
-
-        b = (b_int.to(tl.float16) - z) * s  # dequant in registers
         acc += tl.dot(a, b, out_dtype=tl.float32)
 
         a_ptrs += BLOCK_K * stride_ak
@@ -145,6 +143,11 @@ def w4a16_gemm(
         raise ValueError(f"packed rows ({packed.shape[0]}) must equal K // 8 ({K // 8})")
     if scales.shape != (K // group_size, N) or zeros.shape != (K // group_size, N):
         raise ValueError("scales/zeros must have shape (K // group_size, N)")
+    # The hoisted-scale kernel assumes each K-tile lies within a single group, i.e.
+    # BLOCK_K divides group_size. Autotune uses BLOCK_K in {32, 64}, so group_size
+    # must be a multiple of 64 (covers the common 64 and 128).
+    if group_size % 64 != 0:
+        raise ValueError(f"group_size ({group_size}) must be a multiple of 64")
 
     x = x.contiguous()
     y = torch.empty((M, N), device=x.device, dtype=torch.float16)
