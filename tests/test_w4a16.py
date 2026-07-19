@@ -57,8 +57,10 @@ class TestW4A16Kernel:
     """Triton kernel vs PyTorch reference (GPU)."""
 
     @pytest.mark.parametrize("M,K,N", [
-        (1, 256, 512),       # decode: single token
-        (16, 512, 256),      # small batch
+        (1, 256, 512),       # decode: single token (split-K path, SPLIT_K=1)
+        (1, 4096, 512),      # decode: split-K path with SPLIT_K=8
+        (8, 2048, 256),      # small batch: split-K path
+        (16, 512, 256),      # small batch: non-split path
         (64, 1024, 512),
         (128, 4096, 4096),   # Llama-8B attention projection shape
     ])
