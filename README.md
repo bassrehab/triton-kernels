@@ -24,6 +24,23 @@ Custom kernels help by:
 | [`int8_gemm`](triton_kernels/quantized_matmul.py) | W8A16 quantized matrix multiply | ~1.0x (2x memory savings) |
 | [`fused_moe_forward`](triton_kernels/moe/fused_moe.py) | Fused MoE dispatch (router + experts) | **up to 9.1x** |
 
+## On the Hugging Face Kernel Hub
+
+The fused MoE dispatch kernel is published on the [Hugging Face Kernel Hub](https://huggingface.co/kernels/bassrehab/moe-dispatch)
+as a cross-platform universal (pure-Triton) kernel, validated on NVIDIA A100 and AMD MI300X.
+Load it directly from the Hub, no install required:
+
+```python
+from kernels import get_kernel
+
+# trust_remote_code=True is required until the publisher is on the trusted list
+moe = get_kernel("bassrehab/moe-dispatch", version=1, trust_remote_code=True)
+out, top_k_indices, top_k_weights = moe.fused_moe_forward(
+    hidden_states, router_weight, w_gate, w_up, w_down,
+    num_experts=8, top_k=2, gating="softmax",
+)
+```
+
 ## Installation
 
 ```bash

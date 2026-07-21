@@ -30,7 +30,7 @@ from kernels import get_kernel
 
 # trust_remote_code=True is required until the publisher is on the Hub
 # trusted-publisher list.
-moe = get_kernel("bassrehab/moe-dispatch", version=0, trust_remote_code=True)
+moe = get_kernel("bassrehab/moe-dispatch", version=1, trust_remote_code=True)
 
 num_tokens, hidden, ffn, num_experts, top_k = 4096, 4096, 14336, 8, 2
 dev, dtype = "cuda", torch.float16
@@ -82,8 +82,8 @@ hardware supports it).
 
 ## Status
 
-**Version 0 (alpha).** The API may still change between `v0` revisions; pin an
-explicit `revision` if you need reproducibility.
+**Version 1.** Load with `version=1`. The public API is stable within the major
+version; pin an explicit `revision` if you need bit-for-bit reproducibility.
 
 ## References
 

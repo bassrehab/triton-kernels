@@ -11,7 +11,7 @@ import torch
 from kernels import get_kernel
 
 # trust_remote_code=True is required until bassrehab is a trusted publisher.
-moe = get_kernel("bassrehab/moe-dispatch", version=0, trust_remote_code=True)
+moe = get_kernel("bassrehab/moe-dispatch", version=1, trust_remote_code=True)
 
 nt, h, f, ne, tk = 64, 256, 512, 8, 2
 dev, dt = "cuda", torch.float16

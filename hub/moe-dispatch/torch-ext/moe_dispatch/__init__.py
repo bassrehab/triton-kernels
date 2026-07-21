@@ -10,7 +10,7 @@ Loading from the Hub::
 
     from kernels import get_kernel
 
-    moe = get_kernel("bassrehab/moe-dispatch", version=0, trust_remote_code=True)
+    moe = get_kernel("bassrehab/moe-dispatch", version=1, trust_remote_code=True)
     out, idx, weights = moe.fused_moe_forward(
         hidden_states, router_weight, w_gate, w_up, w_down,
         num_experts=8, top_k=2, gating="softmax",
