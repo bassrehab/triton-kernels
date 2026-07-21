@@ -10,7 +10,7 @@
 # toolchain's deps are prebuilt in the cache, so the build is fast.
 
 [general]
-name = "moe_dispatch"
+name = "moe-dispatch"
 version = 0
 edition = 5
 license = "MIT"
