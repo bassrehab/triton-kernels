@@ -1,5 +1,12 @@
 # Triton Kernels
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg?logo=python&logoColor=white)
+![PyTorch 2.1+](https://img.shields.io/badge/PyTorch-2.1+-ee4c2c.svg?logo=pytorch&logoColor=white)
+![Triton 3.0+](https://img.shields.io/badge/Triton-3.0+-8A2BE2.svg)
+![GPU: NVIDIA | AMD](https://img.shields.io/badge/GPU-NVIDIA%20%7C%20AMD-76B900.svg)
+[![Hugging Face Kernels](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Kernels-FFD21E.svg)](https://huggingface.co/kernels/bassrehab/moe-dispatch)
+
 High-performance GPU kernels for LLM inference, implemented in [OpenAI Triton](https://triton-lang.org/).
 
 This repository provides educational, well-documented implementations of common transformer operations optimized for inference. Each kernel includes roofline analysis explaining *why* the optimization works at the hardware level.
