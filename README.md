@@ -1,5 +1,6 @@
 # Triton Kernels
 
+[![Build](https://github.com/bassrehab/triton-kernels/actions/workflows/build-w4a16.yml/badge.svg?branch=main)](https://github.com/bassrehab/triton-kernels/actions/workflows/build-w4a16.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg?logo=python&logoColor=white)
 ![PyTorch 2.1+](https://img.shields.io/badge/PyTorch-2.1+-ee4c2c.svg?logo=pytorch&logoColor=white)
