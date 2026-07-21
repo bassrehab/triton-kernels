@@ -2,8 +2,9 @@
 
 FP16 activations x INT4 weights with per-group scale/zero, dequantized inside the
 kernel. Ships as a "universal" (torch-noarch) Kernel Hub build - one artifact that runs
-on NVIDIA (SM80/SM90) and AMD (MI300X). The kernel is a copy of triton_kernels/w4a16.py
-from https://github.com/bassrehab/triton-kernels (it has no intra-package imports).
+on NVIDIA (SM80/SM90) and AMD (MI300X). The kernel lives in gemm.py (a copy of
+triton_kernels/w4a16.py from https://github.com/bassrehab/triton-kernels); the submodule
+is named gemm rather than w4a16 to avoid a name collision with this package.
 
 Loading from the Hub::
 
@@ -19,7 +20,7 @@ Loading from the Hub::
 trusted-publisher list.
 """
 
-from .w4a16 import w4a16_gemm, quantize_weight_int4_grouped, pack_int4
+from .gemm import w4a16_gemm, quantize_weight_int4_grouped, pack_int4
 
 __all__ = [
     "w4a16_gemm",
