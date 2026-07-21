@@ -27,8 +27,10 @@ jobs:
           flavor: l4x1
           image: ghcr.io/astral-sh/uv:python3.11-bookworm
           timeout: "3600"
+          # hf-jobs-action flattens `files` to their basename under files_dest,
+          # so this lands at /tmp/files/test.py (not the nested repo path).
           files: hub/moe-dispatch/scripts/test.py
           script: |
             set +x
             export HF_TOKEN="${{ secrets.HF_TOKEN }}"
-            uv run /tmp/files/hub/moe-dispatch/scripts/test.py
+            uv run /tmp/files/test.py
