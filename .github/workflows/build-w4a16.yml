@@ -1,0 +1,48 @@
+name: Build W4A16 kernel
+
+# Builds the universal (pure-Triton) w4a16 kernel on Hugging Face Jobs and uploads it to
+# bassrehab/w4a16. Offloading to HF Jobs keeps the Nix builder off GitHub's runners.
+#
+# Requires a repository secret HF_TOKEN with `job.write` + write access.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "hub/w4a16/torch-ext/**"
+      - "hub/w4a16/build.toml"
+      - "hub/w4a16/flake.nix"
+      - "hub/w4a16/flake.lock"
+      - "hub/w4a16/CARD.md"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build kernel via HF Jobs
+        uses: huggingface/kernel-builder-job@main
+        with:
+          token: ${{ secrets.HF_TOKEN }}
+          namespace: bassrehab
+          flavor: cpu-xl
+          timeout: "21600"
+          script: |
+            # Container starts with `set -x`; disable it so HF_TOKEN is not
+            # echoed into the streamed logs.
+            set +x
+            export HF_TOKEN="${{ secrets.HF_TOKEN }}"
+            # Universal build regenerates artifacts, so skip pulling LFS blobs.
+            export GIT_LFS_SKIP_SMUDGE=1
+
+            git clone "${{ github.server_url }}/${{ github.repository }}" kernel
+            cd kernel
+            git checkout "${{ github.sha }}"
+            # The kernel source lives in a subdirectory of this repo.
+            cd hub/w4a16
+
+            nix run github:huggingface/kernels#kernel-builder -- build-and-upload \
+              --max-jobs 4 \
+              --cores 8 \
+              --repo-id bassrehab/w4a16

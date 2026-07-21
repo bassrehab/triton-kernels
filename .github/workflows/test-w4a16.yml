@@ -1,0 +1,35 @@
+name: Test W4A16 kernel
+
+# Pulls the published bassrehab/w4a16 kernel from the Hub and runs a forward pass on an
+# HF Jobs GPU. Run this AFTER the build workflow so the Hub has fresh artifacts to pull.
+#
+# Requires a repository secret HF_TOKEN with `job.write` access.
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Build W4A16 kernel"]
+    types: [completed]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    # Only test if the build actually succeeded (or on manual dispatch).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run test.py on an HF Jobs GPU
+        uses: huggingface/hf-jobs-action@main
+        with:
+          token: ${{ secrets.HF_TOKEN }}
+          namespace: bassrehab
+          flavor: l4x1
+          image: ghcr.io/astral-sh/uv:python3.11-bookworm
+          timeout: "3600"
+          # hf-jobs-action flattens `files` to their basename under files_dest,
+          # so this lands at /tmp/files/test.py (not the nested repo path).
+          files: hub/w4a16/scripts/test.py
+          script: |
+            set +x
+            export HF_TOKEN="${{ secrets.HF_TOKEN }}"
+            uv run /tmp/files/test.py
