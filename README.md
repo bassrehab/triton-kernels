@@ -23,22 +23,22 @@ Custom kernels help by:
 | [`swiglu_fused`](triton_kernels/swiglu.py) | Fused SiLU-gated linear unit | **1.6x** |
 | [`int8_gemm`](triton_kernels/quantized_matmul.py) | W8A16 quantized matrix multiply | ~1.0x (2x memory savings) |
 | [`fused_moe_forward`](triton_kernels/moe/fused_moe.py) | Fused MoE dispatch (router + experts) | **up to 9.1x** |
+| [`w4a16_gemm`](triton_kernels/w4a16.py) | W4A16 4-bit weight-only GEMM (GPTQ/AWQ) | **1.2-1.3x vs FP16 (decode)**, 4x less weight memory |
 
 ## On the Hugging Face Kernel Hub
 
-The fused MoE dispatch kernel is published on the [Hugging Face Kernel Hub](https://huggingface.co/kernels/bassrehab/moe-dispatch)
-as a cross-platform universal (pure-Triton) kernel, validated on NVIDIA A100 and AMD MI300X.
-Load it directly from the Hub, no install required:
+Two kernels are published on the [Hugging Face Kernel Hub](https://huggingface.co/kernels)
+as cross-platform universal (pure-Triton) kernels, loadable directly with no install:
+
+- **[bassrehab/moe-dispatch](https://huggingface.co/kernels/bassrehab/moe-dispatch)** - fused MoE dispatch (router + top-k gating + grouped expert GEMM), validated on NVIDIA A100 and AMD MI300X.
+- **[bassrehab/w4a16](https://huggingface.co/kernels/bassrehab/w4a16)** - 4-bit weight-only GEMM that beats cuBLAS FP16 in the decode regime (1.2-1.3x), validated on A100.
 
 ```python
 from kernels import get_kernel
 
 # trust_remote_code=True is required until the publisher is on the trusted list
 moe = get_kernel("bassrehab/moe-dispatch", version=1, trust_remote_code=True)
-out, top_k_indices, top_k_weights = moe.fused_moe_forward(
-    hidden_states, router_weight, w_gate, w_up, w_down,
-    num_experts=8, top_k=2, gating="softmax",
-)
+w4a16 = get_kernel("bassrehab/w4a16", version=1, trust_remote_code=True)
 ```
 
 ## Installation
