@@ -1,21 +1,22 @@
 {
-  description = "Fused MoE dispatch - cross-platform Triton kernel (universal build)";
+  description = "Fused MoE dispatch - cross-platform Triton kernel (torch-noarch)";
 
+  # subhadipmitra, 2026-07-21: the builder now lives in huggingface/kernels and uses
+  # genKernelFlakeOutputs (edition 5). Schema mirrors the current relu-triton example.
+  # Not pinning a flake.lock so the CURRENT (cached) toolchain is used; the previous
+  # pinned old release cache-missed and rebuilt the whole torch/CUDA/LLVM closure from
+  # source (hours).
   inputs = {
-    kernel-builder.url = "github:huggingface/kernel-builder";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
-    { self, kernel-builder }:
-    kernel-builder.lib.genFlakeOutputs {
+    {
+      self,
+      kernel-builder,
+    }:
+    kernel-builder.lib.genKernelFlakeOutputs {
+      inherit self;
       path = ./.;
-      rev = self.shortRev or self.dirtyShortRev or self.lastModifiedDate;
-      # subhadipmitra, 2026-07-21: skip the post-build get_kernel import check. It
-      # needs a full torch/triton/CUDA runtime just to import the kernel, which on a
-      # cache-missed toolchain rebuilds LLVM/PyTorch from source (hours). This is a
-      # pure-Triton universal kernel with no compiled artifact, and import/correctness
-      # were already validated on A100, so the check adds only build time. It is also
-      # the documented workaround for triton.autotune kernels in a GPU-less sandbox.
-      doGetKernelCheck = false;
     };
 }

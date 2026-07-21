@@ -1,23 +1,25 @@
-# kernel-builder configuration for the fused MoE dispatch kernel.
+# kernel-builder configuration for the fused MoE dispatch kernel (edition 5).
 #
-# This is a pure-Triton kernel (no C++/CUDA to compile), so it builds as a
-# "universal" Torch extension: kernel-builder packages the Python + Triton
-# sources under build/torch-universal/ and the `kernels` runtime JIT-compiles
-# the Triton at load time. One build therefore runs everywhere the Triton
-# backend does - NVIDIA (SM80/SM90) and AMD (MI300X) - from a single artifact.
+# Pure-Triton kernel: no C++/CUDA to compile. Declared as a torch-noarch (JIT)
+# kernel so one artifact runs on every Triton backend. Schema mirrors the current
+# huggingface/kernels relu-triton example.
 #
-# subhadipmitra, 2026-07-19: universal builds intentionally omit the [torch]
-# and [kernel.*] sections - those only apply to compiled backends. Keeping this
-# minimal is correct, not incomplete.
+# subhadipmitra, 2026-07-21: use the CURRENT kernel-builder toolchain (edition 5,
+# torch-noarch) instead of pinning an old release. The old pin cache-missed HF's
+# binary cache and rebuilt torch/LLVM/CUDA from source (hours); the current
+# toolchain's deps are prebuilt in the cache, so the build is fast.
 
 [general]
-# Must equal the Hub repo name with '-' replaced by '_' (repo: moe-dispatch).
 name = "moe_dispatch"
-universal = true
-# subhadipmitra, 2026-07-19: version 0 is the Hub convention for alpha kernels
-# whose public API may still change between revisions. Bump to 1 once the
-# fused_moe_forward signature is frozen. build-and-upload pushes to the v0 branch.
 version = 0
+edition = 5
+license = "MIT"
+backends = [
+    "cuda",
+    "rocm",
+]
 
 [general.hub]
 repo-id = "bassrehab/moe-dispatch"
+
+[torch-noarch]
