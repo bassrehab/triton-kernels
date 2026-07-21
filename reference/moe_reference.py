@@ -2,7 +2,7 @@
 PyTorch reference implementation of Mixture-of-Experts (MoE) forward pass.
 
 This serves as ground truth for correctness validation of the Triton MoE kernels.
-No Triton or custom CUDA is used — pure PyTorch operations only.
+No Triton or custom CUDA is used - pure PyTorch operations only.
 
 The implementation covers the full MoE forward pass:
 1. Router computation (softmax or sigmoid gating)
@@ -71,7 +71,7 @@ def moe_router_torch(
         Named tuple with top_k_indices, top_k_weights, and router_logits.
     """
     # subhadipmitra, 2026-03-14: cast to float32 for the router projection to avoid
-    # precision issues — the logits are small differences between large dot products,
+    # precision issues - the logits are small differences between large dot products,
     # so FP16 accumulation causes significant routing errors on Mixtral-scale dims
     router_logits = F.linear(hidden_states.float(), router_weight.float(), router_bias)
 
@@ -135,7 +135,7 @@ def permute_tokens(
     # Flatten expert assignments: (num_tokens * top_k,)
     flat_indices = top_k_indices.reshape(-1)
 
-    # subhadipmitra, 2026-03-14: stable sort is critical here — it preserves the
+    # subhadipmitra, 2026-03-14: stable sort is critical here - it preserves the
     # relative order of tokens assigned to the same expert, which makes the output
     # deterministic and easier to debug. Unstable sort would give correct results
     # but non-reproducible token ordering within each expert bucket
@@ -143,7 +143,7 @@ def permute_tokens(
 
     # Compute expert offsets (cumulative count boundaries)
     # subhadipmitra, 2026-03-14: scatter_add histogram is faster than torch.bincount
-    # for GPU tensors — bincount does a CPU sync internally on some torch versions
+    # for GPU tensors - bincount does a CPU sync internally on some torch versions
     expert_counts = torch.zeros(num_experts, dtype=torch.int64, device=hidden_states.device)
     expert_counts.scatter_add_(0, flat_indices.long(), torch.ones_like(flat_indices, dtype=torch.int64))
     expert_offsets = torch.zeros(num_experts + 1, dtype=torch.int64, device=hidden_states.device)
@@ -237,7 +237,7 @@ def expert_ffn(
 
 class MoEReference(torch.nn.Module):
     """
-    Reference MoE layer — pure PyTorch, no kernel optimization.
+    Reference MoE layer - pure PyTorch, no kernel optimization.
 
     Implements the complete MoE forward pass with configurable gating,
     top-k routing, and SwiGLU expert FFNs.

@@ -1,3 +1,5 @@
+# AUTO-GENERATED from triton_kernels/moe/expert_gemm.py by hub/moe-dispatch/sync_sources.py.
+# Edit the canonical source under triton_kernels/moe/, then re-run the sync script.
 """
 Triton kernels for grouped expert GEMM in MoE dispatch.
 

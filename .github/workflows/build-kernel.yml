@@ -1,0 +1,49 @@
+name: Build MoE dispatch kernel
+
+# Builds the universal (pure-Triton) moe_dispatch kernel on Hugging Face Jobs
+# and uploads it to bassrehab/moe-dispatch. Offloading to HF Jobs keeps the
+# Nix builder off GitHub's runners (see the HF Kernels GitHub Actions guide).
+#
+# Requires a repository secret HF_TOKEN with `job.write` + write access.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "hub/moe-dispatch/torch-ext/**"
+      - "hub/moe-dispatch/build.toml"
+      - "hub/moe-dispatch/flake.nix"
+      - "hub/moe-dispatch/flake.lock"
+      - "hub/moe-dispatch/CARD.md"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build kernel via HF Jobs
+        uses: huggingface/kernel-builder-job@main
+        with:
+          token: ${{ secrets.HF_TOKEN }}
+          namespace: bassrehab
+          flavor: cpu-xl
+          timeout: "21600"
+          script: |
+            # Container starts with `set -x`; disable it so HF_TOKEN is not
+            # echoed into the streamed logs.
+            set +x
+            export HF_TOKEN="${{ secrets.HF_TOKEN }}"
+            # Universal build regenerates artifacts, so skip pulling LFS blobs.
+            export GIT_LFS_SKIP_SMUDGE=1
+
+            git clone "${{ github.server_url }}/${{ github.repository }}" kernel
+            cd kernel
+            git checkout "${{ github.sha }}"
+            # The kernel source lives in a subdirectory of this repo.
+            cd hub/moe-dispatch
+
+            nix run github:huggingface/kernels#kernel-builder -- build-and-upload \
+              --max-jobs 4 \
+              --cores 8 \
+              --repo-id bassrehab/moe-dispatch

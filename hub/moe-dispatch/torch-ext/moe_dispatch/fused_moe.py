@@ -1,3 +1,5 @@
+# AUTO-GENERATED from triton_kernels/moe/fused_moe.py by hub/moe-dispatch/sync_sources.py.
+# Edit the canonical source under triton_kernels/moe/, then re-run the sync script.
 """
 Fused MoE dispatch kernels - the core of this project.
 
@@ -38,9 +40,9 @@ import triton
 import triton.language as tl
 from typing import Tuple
 
-from triton_kernels.moe.router import moe_router
-from triton_kernels.moe.permute import permute_tokens, unpermute_tokens
-from triton_kernels.moe.expert_gemm import grouped_gemm, _build_block_schedule
+from .router import moe_router
+from .permute import permute_tokens, unpermute_tokens
+from .expert_gemm import grouped_gemm, _build_block_schedule
 
 
 # subhadipmitra, 2026-03-15: same BLOCK_M=64 constraint as the unfused grouped GEMM -

@@ -6,7 +6,7 @@ and measure how close each stage operates to its theoretical ceiling.
 
 Stages analyzed:
 1. Router (compute-bound for large batches)
-2. Permute (memory-bound — pure data movement)
+2. Permute (memory-bound - pure data movement)
 3. Expert GEMM / Fused gate+up (compute-bound)
 4. Unpermute + combine (memory-bound)
 
@@ -267,7 +267,7 @@ def run_roofline(
             plot_roofline(
                 results,
                 gpu_specs=gpu,
-                title=f"MoE Dispatch Roofline — {model_name} ({num_tokens} tokens)",
+                title=f"MoE Dispatch Roofline - {model_name} ({num_tokens} tokens)",
                 save_path=output_path,
                 show=False,
             )

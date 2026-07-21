@@ -1,3 +1,5 @@
+# AUTO-GENERATED from triton_kernels/moe/router.py by hub/moe-dispatch/sync_sources.py.
+# Edit the canonical source under triton_kernels/moe/, then re-run the sync script.
 """
 Triton kernel for MoE router: gating score computation and top-k expert selection.
 

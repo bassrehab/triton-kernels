@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the design, implementation, and performance of a **fused Mixture-of-Experts (MoE) dispatch kernel** written entirely in [OpenAI Triton](https://github.com/openai/triton). The kernel performs the complete MoE forward pass — from router scoring through expert computation to weighted output combination — using only Triton primitives, enabling cross-platform portability across NVIDIA and AMD GPUs.
+This document describes the design, implementation, and performance of a **fused Mixture-of-Experts (MoE) dispatch kernel** written entirely in [OpenAI Triton](https://github.com/openai/triton). The kernel performs the complete MoE forward pass - from router scoring through expert computation to weighted output combination - using only Triton primitives, enabling cross-platform portability across NVIDIA and AMD GPUs.
 
 MoE architectures power the majority of frontier LLMs in 2025-2026 (Mixtral, DeepSeek-V3, Qwen2-MoE, etc.), but their inference is bottlenecked by irregular memory access patterns and expert routing overhead. Existing optimized implementations (Megablocks, vLLM's FusedMoE) are tightly coupled to CUDA. This project provides a **standalone, portable, educational** implementation with rigorous performance characterization.
 
@@ -41,7 +41,7 @@ The biggest memory traffic optimization: a single kernel computes both gate and 
 
 **4. FP32 accumulation throughout**
 
-All GEMM accumulators and the unpermute weighted combination use FP32 accumulation with FP16 inputs. This is critical for numerical stability — the router softmax, SiLU activation, and weighted combination all lose significant precision without it.
+All GEMM accumulators and the unpermute weighted combination use FP32 accumulation with FP16 inputs. This is critical for numerical stability - the router softmax, SiLU activation, and weighted combination all lose significant precision without it.
 
 **5. Stable top-k with -1.0 masking**
 
@@ -86,7 +86,7 @@ DeepSeek-V3 is the hardest configuration: 256 experts means each expert gets onl
 | 512    | 23.81 ms         | 4.36 ms        | **3.60 ms**  | **6.6x**          |
 | 2048   | 37.50 ms         | 11.85 ms       | **6.61 ms**  | **5.7x**          |
 
-At 2048 tokens, the fused kernel is **1.8x faster than unfused** — the fusion benefit grows with batch size because the eliminated memory traffic (gate_out + up_out) scales linearly with token count.
+At 2048 tokens, the fused kernel is **1.8x faster than unfused** - the fusion benefit grows with batch size because the eliminated memory traffic (gate_out + up_out) scales linearly with token count.
 
 ## Roofline Analysis
 
@@ -105,7 +105,7 @@ Per-stage roofline profiling at 512 tokens on A100-SXM4-80GB.
 | Stage | Latency | AI (FLOPs/B) | Bandwidth | BW Efficiency | TFLOPS | Compute Eff |
 |-------|---------|-------------|-----------|---------------|--------|-------------|
 | Router | 0.059 ms | 7.86 | 73 GB/s | 3.6% | 0.57 | 0.2% |
-| Permute | 0.116 ms | ~0 | 109 GB/s | 5.3% | — | — |
+| Permute | 0.116 ms | ~0 | 109 GB/s | 5.3% | - | - |
 | Expert FFN (unfused) | 3.66 ms | 122 | 806 GB/s | **39.5%** | 98.5 | **31.6%** |
 | Expert FFN (fused) | 3.14 ms | 125 | **922 GB/s** | **45.2%** | **115.0** | **36.8%** |
 | Unpermute+Combine | 0.017 ms | 0.67 | 756 GB/s | 37.1% | 0.50 | 0.2% |
@@ -113,7 +113,7 @@ Per-stage roofline profiling at 512 tokens on A100-SXM4-80GB.
 Key observations:
 - **Expert FFN dominates latency** (>95% of total time), as expected for compute-bound GEMMs
 - **Fused kernel achieves 45% of peak bandwidth** and **37% of peak compute** simultaneously
-- **Unpermute achieves 37% of peak bandwidth** — reasonable for a scatter operation with irregular access
+- **Unpermute achieves 37% of peak bandwidth** - reasonable for a scatter operation with irregular access
 - **Router and permute are negligible** (<5% of total time)
 
 ### DeepSeek-V3 (512 tokens)
@@ -121,7 +121,7 @@ Key observations:
 | Stage | Latency | BW Efficiency | Compute Eff |
 |-------|---------|---------------|-------------|
 | Router | 0.214 ms | 2.6% | 2.8% |
-| Permute | 0.134 ms | 24.2% | — |
+| Permute | 0.134 ms | 24.2% | - |
 | Expert FFN (unfused) | 22.1 ms | **50.4%** | 5.2% |
 | Unpermute+Combine | 0.060 ms | **54.0%** | 0.3% |
 
@@ -152,7 +152,7 @@ The fused gate+up kernel reads `permuted_tokens` once (instead of twice) and com
 
 [Megablocks](https://github.com/stanford-futuredata/megablocks) (Stanford/Databricks) uses custom CUDA kernels with block-sparse matrix operations. It is the current state-of-the-art for MoE inference on NVIDIA GPUs.
 
-### Mixtral-8x7B — Triton Fused vs Megablocks dMoE
+### Mixtral-8x7B - Triton Fused vs Megablocks dMoE
 
 | Tokens | Triton Fused | Megablocks | Triton / Megablocks |
 |--------|-------------|------------|---------------------|
@@ -161,7 +161,7 @@ The fused gate+up kernel reads `permuted_tokens` once (instead of twice) and com
 | 512    | 3.99 ms     | 3.57 ms    | **89%**             |
 | 2048   | 16.20 ms    | 9.08 ms    | 56%                 |
 
-### Qwen2-MoE-57B — Triton Fused vs Megablocks dMoE
+### Qwen2-MoE-57B - Triton Fused vs Megablocks dMoE
 
 | Tokens | Triton Fused | Megablocks | Triton / Megablocks |
 |--------|-------------|------------|---------------------|
@@ -171,10 +171,10 @@ The fused gate+up kernel reads `permuted_tokens` once (instead of twice) and com
 | 2048   | 6.59 ms     | 4.00 ms    | 61%                 |
 
 **Key findings:**
-- At **small batch sizes (≤128 tokens)**, our Triton fused kernel **beats Megablocks** — likely due to lower kernel launch overhead (5 launches vs Megablocks' more complex dispatch)
-- At **512 tokens**, we achieve **89-93% of Megablocks** throughput — exceeding our ≥70% target
+- At **small batch sizes (≤128 tokens)**, our Triton fused kernel **beats Megablocks** - likely due to lower kernel launch overhead (5 launches vs Megablocks' more complex dispatch)
+- At **512 tokens**, we achieve **89-93% of Megablocks** throughput - exceeding our ≥70% target
 - At **2048+ tokens**, Megablocks' CUDA block-sparse matmul pulls ahead as the workload becomes fully compute-bound and Megablocks' hand-tuned CUDA kernels extract more tensor core utilization
-- **All this without a single line of CUDA** — our implementation is pure Triton, portable to AMD GPUs
+- **All this without a single line of CUDA** - our implementation is pure Triton, portable to AMD GPUs
 
 ## Limitations and Future Work
 

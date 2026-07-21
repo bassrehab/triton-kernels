@@ -6,7 +6,7 @@ This repository provides educational, well-documented implementations of common 
 
 ## Why Custom Kernels?
 
-LLM inference is **memory-bandwidth bound**. A 7B parameter model in FP16 requires loading 14GB of weights for every forward pass. On an A100 (2TB/s bandwidth), this takes ~7ms—while the actual computation is <0.1ms.
+LLM inference is **memory-bandwidth bound**. A 7B parameter model in FP16 requires loading 14GB of weights for every forward pass. On an A100 (2TB/s bandwidth), this takes ~7ms-while the actual computation is <0.1ms.
 
 Custom kernels help by:
 
@@ -181,9 +181,9 @@ Fused MoE dispatch kernel benchmarked against PyTorch reference (loop-over-exper
 | 512    | 25.92 ms   | 3.57 ms    | 3.99 ms      | **6.5x**          | 89%           |
 | 2048   | 66.22 ms   | 9.08 ms    | 16.48 ms     | **4.0x**          | 56%           |
 
-Our Triton kernel **beats the CUDA-optimized Megablocks** at inference-relevant batch sizes (≤128 tokens) and achieves 89% at 512 tokens — using **zero CUDA code**. Cross-platform validated on AMD MI300X (162/162 tests pass).
+Our Triton kernel **beats the CUDA-optimized Megablocks** at inference-relevant batch sizes (≤128 tokens) and achieves 89% at 512 tokens - using **zero CUDA code**. Cross-platform validated on AMD MI300X (162/162 tests pass).
 
-![MoE Roofline — Mixtral-8x7B](docs/figures/moe_roofline_mixtral.png)
+![MoE Roofline - Mixtral-8x7B](docs/figures/moe_roofline_mixtral.png)
 
 See [docs/moe_dispatch.md](docs/moe_dispatch.md) for the full technical writeup with roofline analysis and design decisions.
 
@@ -204,7 +204,7 @@ See [docs/ROOFLINE_ANALYSIS.md](docs/ROOFLINE_ANALYSIS.md) for detailed analysis
 
 ### 1. Fusion Wins Big for Memory-Bound Operations
 
-RMSNorm reads and writes the entire tensor. PyTorch launches multiple small kernels with intermediate tensors. Triton fuses everything into one kernel, achieving **88% of peak bandwidth**—an **8x speedup**.
+RMSNorm reads and writes the entire tensor. PyTorch launches multiple small kernels with intermediate tensors. Triton fuses everything into one kernel, achieving **88% of peak bandwidth**-an **8x speedup**.
 
 ### 2. Quantization is About Memory, Not Compute
 
@@ -212,7 +212,7 @@ Loading INT8 weights instead of FP16 halves memory traffic. However, INT8 tensor
 
 ### 3. Bandwidth Utilization Matters More Than FLOPS
 
-Most "optimizations" in LLM inference are really about using the memory bus efficiently. Our Triton kernels achieve 80-88% of peak bandwidth—near optimal. PyTorch baselines often achieve only 10-20% due to kernel launch overhead and intermediate tensors.
+Most "optimizations" in LLM inference are really about using the memory bus efficiently. Our Triton kernels achieve 80-88% of peak bandwidth-near optimal. PyTorch baselines often achieve only 10-20% due to kernel launch overhead and intermediate tensors.
 
 ## Project Structure
 

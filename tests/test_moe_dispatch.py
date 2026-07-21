@@ -81,7 +81,7 @@ class TestMoERouterSoftmax:
             hidden_states, router_weight, top_k, gating="softmax",
         )
 
-        # Compare expert selections — allow mismatches when scores are near-tied
+        # Compare expert selections - allow mismatches when scores are near-tied
         # (FP rounding can cause Triton vs PyTorch to pick different experts)
         match_count = 0
         for t in range(num_tokens):
@@ -952,7 +952,7 @@ class TestFusedMoEForward:
         # Reference
         ref_output, ref_routing = ref_moe(x)
 
-        # Fused — use same routing to isolate GEMM correctness
+        # Fused - use same routing to isolate GEMM correctness
         permuted, offsets, sorted_idx, restore_idx = permute_tokens(
             x, ref_routing.top_k_indices, num_experts,
         )
@@ -963,7 +963,7 @@ class TestFusedMoEForward:
             num_tokens, top_k,
         )
 
-        # Relaxed tolerance — fused kernel has different accumulation order
+        # Relaxed tolerance - fused kernel has different accumulation order
         torch.testing.assert_close(fused_output, ref_output, rtol=5e-2, atol=5e-2)
 
     @pytest.mark.parametrize("model_name", ["mixtral-8x7b", "qwen2-moe-57b"])

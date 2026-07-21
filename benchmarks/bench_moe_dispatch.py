@@ -254,7 +254,7 @@ def run_benchmark(
         results = []
 
         # subhadipmitra, 2026-03-21: skip reference for large token counts
-        # on DeepSeek-V3 — 256 experts * 3 matmuls * Python loop is painfully slow
+        # on DeepSeek-V3 - 256 experts * 3 matmuls * Python loop is painfully slow
         if not skip_reference and not (model_name == "deepseek-v3" and num_tokens > 128):
             try:
                 r = bench_pytorch_reference(num_tokens, cfg)
