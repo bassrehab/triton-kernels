@@ -20,6 +20,13 @@ SHAPES = {
     "llama3-8b-attn-qkv": (4096, 4096),
     "llama3-8b-ffn-up": (4096, 14336),
     "qwen2-72b-ffn": (8192, 29568),
+    # subhadipmitra, 2026-07-19: current-generation shapes (models released within the
+    # last two years). Dims track the rows above closely; the W4A16 win follows the
+    # matrix shape, not the model's release date.
+    "llama3.3-70b-ffn": (8192, 28672),     # Llama 3.3 70B (Dec 2024), gate/up proj
+    "qwen3-32b-ffn": (5120, 25600),        # Qwen3-32B (2025), gate/up proj
+    "deepseek-v3.2-ffn": (7168, 18432),    # DeepSeek-V3.2 (2026), dense MLP gate/up
+    "deepseek-v3.2-moe-up": (7168, 2048),  # DeepSeek-V3.2 (2026), MoE expert up (256 experts)
 }
 
 
